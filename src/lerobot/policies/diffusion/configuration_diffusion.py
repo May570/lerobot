@@ -159,6 +159,13 @@ class DiffusionConfig(PreTrainedConfig):
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
 
+    # RTC parameters
+    # use_rtc: bool = False
+    # stop_rtc_thread = False
+    rtc_beta: float = 5.0
+    rtc_smin: int = 4
+    rtc_n_steps: int = 5
+
     def __post_init__(self):
         super().__post_init__()
 

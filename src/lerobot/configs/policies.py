@@ -70,6 +70,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     # Add tags to your policy on the hub.
     license: str | None = None
 
+    use_rtc: bool = False
+
     def __post_init__(self):
         self.pretrained_path = None
         if not self.device or not is_torch_device_available(self.device):

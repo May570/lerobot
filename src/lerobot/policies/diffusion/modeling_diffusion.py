@@ -21,8 +21,21 @@ TODO(alexander-soare):
 """
 
 import math
+import time
+import logging
+import threading
 from collections import deque
 from typing import Callable
+
+# logging.basicConfig(
+#     level=logging.DEBUG,
+#     format="%(asctime)s - %(levelname)s - %(message)s",
+#     handlers=[
+#         logging.FileHandler("diffusion_policy.log"),
+#         logging.StreamHandler()
+#     ],
+#     force=True,
+# )
 
 import einops
 import numpy as np
@@ -83,6 +96,12 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         self.diffusion = DiffusionModel(config)
 
+        self.use_rtc = getattr(config, "use_rtc", False)
+        self.rtc_thread = None  # 用来保存RTC线程
+        self.stop_rtc_thread = False  # 用于停止RTC线程的标志
+        self._executed_action_count = 0  # 主线程执行动作的数量
+        self._action_counter_lock = threading.Lock()  # 确保线程安全
+
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -110,6 +129,46 @@ class DiffusionPolicy(PreTrainedPolicy):
         actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
 
         return actions
+    
+    def _start_rtc_inference(self, batch: dict[str, Tensor]) -> Tensor:
+        if self.rtc_thread is None or not self.rtc_thread.is_alive():
+            self.rtc_thread = threading.Thread(target=self.rtc_generate_actions, args=(batch,))
+            self.rtc_thread.start()
+        else:
+            print("RTC thread is already running.")
+
+    def rtc_generate_actions(self, batch: dict[str, Tensor]):
+        while not self.stop_rtc_thread:
+            input_batch = {
+                k: torch.stack(list(self._queues[k]), dim=1)
+                for k in self._queues
+                if k != ACTION and len(self._queues[k]) == self._queues[k].maxlen
+            }
+
+            # 只有当观测序列齐备时才生成
+            if len(input_batch) == 0 or any(v.shape[1] < self.config.n_obs_steps for v in input_batch.values()):
+                time.sleep(0.01)
+                continue
+
+            with self._action_counter_lock:
+                start_count = self._executed_action_count
+
+            actions = self.diffusion.generate_actions(input_batch)
+            actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
+
+            with self._action_counter_lock:
+                end_count = self._executed_action_count
+
+            delay = end_count - start_count # 8
+
+            actions = actions[:, 4:, :]  # 删除延迟帧的动作
+            # logging.info(f"[RTC] Generated {actions.shape} actions, trimmed first {delay} for delay alignment")
+
+            # 替换整个动作队列
+            # self._queues[ACTION] = deque(actions.transpose(0, 1), maxlen=self.config.n_action_steps)
+            self._queues[ACTION] = deque(actions.transpose(0, 1), maxlen=16)
+
+            # time.sleep(0.01)
 
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -140,12 +199,31 @@ class DiffusionPolicy(PreTrainedPolicy):
         # Note: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
-        if len(self._queues[ACTION]) == 0:
-            actions = self.predict_action_chunk(batch)
-            self._queues[ACTION].extend(actions.transpose(0, 1))
+        if self.config.use_rtc:
+            # use RTC to select action
+            if self.rtc_thread is None or not self.rtc_thread.is_alive():
+                self._start_rtc_inference(batch)
 
-        action = self._queues[ACTION].popleft()
-        return action
+            while len(self._queues[ACTION]) == 0:
+                # print("No actions available, waiting for inference to generate actions...")
+                time.sleep(0.001)
+
+            action = self._queues[ACTION].popleft()
+            # queue_length = len(self._queues[ACTION])
+            # logging.info(f"queue[ACTION] shape: {queue_length}")
+
+            with self._action_counter_lock:
+                self._executed_action_count += 1
+
+            return action
+        else:
+            # default selection method
+            if len(self._queues[ACTION]) == 0:
+                actions = self.predict_action_chunk(batch)
+                self._queues[ACTION].extend(actions.transpose(0, 1))
+            
+            action = self._queues[ACTION].popleft()
+            return action
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
@@ -299,6 +377,7 @@ class DiffusionModel(nn.Module):
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
+        end = max(end, actions.shape[1])
         actions = actions[:, start:end]
 
         return actions

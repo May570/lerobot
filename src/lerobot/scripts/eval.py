@@ -181,6 +181,11 @@ def rollout(
         # Keep track of which environments are done so far.
         done = terminated | truncated | done
 
+        # If the inference is done, stop the RTC thread.
+        if np.all(done):
+            if policy.use_rtc:
+                policy.stop_rtc_thread = True
+
         all_actions.append(torch.from_numpy(action))
         all_rewards.append(torch.from_numpy(reward))
         all_dones.append(torch.from_numpy(done))
