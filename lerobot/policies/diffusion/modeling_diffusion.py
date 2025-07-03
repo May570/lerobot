@@ -159,16 +159,16 @@ class DiffusionPolicy(PreTrainedPolicy):
             with self._action_counter_lock:
                 end_count = self._executed_action_count
 
-            delay = end_count - start_count # 8
+            delay = end_count - start_count # 6-8
 
-            actions = actions[:, 4:, :]  # 删除延迟帧的动作
-            # logging.info(f"[RTC] Generated {actions.shape} actions, trimmed first {delay} for delay alignment")
+            actions = actions[:, 4:, :]  # 删除前面延迟帧的动作，4-6最好
+            # logging.info(f"[RTC] Generated {actions.shape} actions")
 
             # 替换整个动作队列
             # self._queues[ACTION] = deque(actions.transpose(0, 1), maxlen=self.config.n_action_steps)
-            self._queues[ACTION] = deque(actions.transpose(0, 1), maxlen=16)
+            self._queues[ACTION] = deque(actions.transpose(0, 1), maxlen=16) # 尾部不裁剪
 
-            # time.sleep(0.01)
+            time.sleep(0.1) # 必须休眠，有助于减少时间回溯
 
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -206,7 +206,7 @@ class DiffusionPolicy(PreTrainedPolicy):
 
             while len(self._queues[ACTION]) == 0:
                 # print("No actions available, waiting for inference to generate actions...")
-                time.sleep(0.001)
+                time.sleep(0.0001)
 
             action = self._queues[ACTION].popleft()
             # queue_length = len(self._queues[ACTION])
@@ -377,8 +377,9 @@ class DiffusionModel(nn.Module):
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
-        end = max(end, actions.shape[1])
-        actions = actions[:, start:end]
+        # actions = actions[:, start:end]
+        actions = actions[:, start:] # 只保留从当前观测开始的动作序列，但是尾部不裁剪
+        # logging.info(f"actions shape: {actions.shape}")
 
         return actions
 
