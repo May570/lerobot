@@ -162,9 +162,9 @@ class DiffusionConfig(PreTrainedConfig):
     # RTC parameters
     # use_rtc: bool = False
     # stop_rtc_thread = False
-    rtc_beta: float = 5.0
-    rtc_smin: int = 4
-    rtc_n_steps: int = 5
+    rtc_beta: float = 2.0 # 引导项最大权重
+    rtc_delay: int = 9 # 延迟步数
+    rtc_soft_steps: int = 6 # 软引导步数
 
     def __post_init__(self):
         super().__post_init__()

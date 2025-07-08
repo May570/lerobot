@@ -183,7 +183,7 @@ def rollout(
 
         # If the inference is done, stop the RTC thread.
         if np.all(done):
-            if policy.use_rtc:
+            if policy.config.use_rtc:
                 policy.stop_rtc_thread = True
 
         all_actions.append(torch.from_numpy(action))
