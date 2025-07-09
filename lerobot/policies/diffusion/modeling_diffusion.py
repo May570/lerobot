@@ -101,6 +101,7 @@ class DiffusionPolicy(PreTrainedPolicy):
         self.stop_rtc_thread = False  # 用于停止RTC线程的标志
         self._executed_action_count = 0  # 主线程执行动作的数量
         self._action_counter_lock = threading.Lock()  # 确保线程安全
+        self.update_ob = False  # 用于更新observation的标志
 
         self.reset()
 
@@ -137,8 +138,16 @@ class DiffusionPolicy(PreTrainedPolicy):
         else:
             print("RTC thread is already running.")
 
-    def rtc_generate_actions(self, batch: dict[str, Tensor]):
+    def rtc_generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
         while not self.stop_rtc_thread:
+            # logging.info(f"self.update_ob: {self.update_ob}")
+            observation = self.get_obs()
+
+            if self.update_ob is False:
+                # logging.info(f"RTC thread is waiting for update_ob to be True...")
+                time.sleep(0.01)
+                continue
+
             input_batch = {
                 k: torch.stack(list(self._queues[k]), dim=1)
                 for k in self._queues
@@ -146,30 +155,33 @@ class DiffusionPolicy(PreTrainedPolicy):
             }
 
             # 只有当观测序列齐备时才生成
-            if len(input_batch) == 0 or any(v.shape[1] < self.config.n_obs_steps for v in input_batch.values()):
-                time.sleep(0.01)
-                continue
+            # if len(input_batch) == 0 or any(v.shape[1] < self.config.n_obs_steps for v in input_batch.values()):
+            #     time.sleep(0.01)
+            #     continue
 
             with self._action_counter_lock:
                 start_count = self._executed_action_count
 
+            # logging.info(f"2. start inference")
             actions = self.diffusion.generate_actions(input_batch)
             actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
+            # logging.info(f"3. finish inference")
 
             with self._action_counter_lock:
                 end_count = self._executed_action_count
 
             delay = end_count - start_count # 6-8
 
-            actions = actions[:, delay:, :]  # 删除前面延迟帧的动作，4-6最好
+            actions = actions[:, delay:, :]  # 删除延迟动作
             # logging.info(f"after cutting,there are {actions.shape} actions")
             logging.info(f"there are {delay} delay")
 
             # 替换整个动作队列
             # self._queues[ACTION] = deque(actions.transpose(0, 1), maxlen=self.config.n_action_steps)
             self._queues[ACTION] = deque(actions.transpose(0, 1), maxlen=16) # 尾部不裁剪
+            self.update_ob = False
 
-            # time.sleep(0.1)
+            # time.sleep(0.05)
 
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -199,6 +211,8 @@ class DiffusionPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         # Note: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
+        # logging.info(f"1. update batch queues")
+        self.update_ob = True  # 设置标志，通知RTC线程更新observation
 
         if self.config.use_rtc:
             # use RTC to select action
@@ -207,7 +221,7 @@ class DiffusionPolicy(PreTrainedPolicy):
 
             while len(self._queues[ACTION]) == 0:
                 # print("No actions available, waiting for inference to generate actions...")
-                time.sleep(0.01)
+                time.sleep(0.0001)
 
             action = self._queues[ACTION].popleft()
             # queue_length = len(self._queues[ACTION])
@@ -364,7 +378,8 @@ class DiffusionModel(nn.Module):
 
         # Sample prior.
         sample = torch.randn(
-            size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
+            # size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
+            size=(batch_size, 24, self.config.action_feature.shape[0]),
             dtype=dtype,
             device=device,
             generator=generator,
@@ -441,6 +456,7 @@ class DiffusionModel(nn.Module):
 
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        # logging.info(f"4. get global_cond")
 
         if self.config.use_rtc:
             if self._rtc_prev_chunk is not None:
@@ -449,18 +465,18 @@ class DiffusionModel(nn.Module):
                 actions = self.guided_sample(batch_size, global_cond=global_cond, prev_chunk=self._rtc_prev_chunk)
                 actions = actions[:, start:] # 只保留从当前观测开始的动作序列，但是尾部不裁剪
                 # logging.info(f"2. rtc actions shape: {actions.shape}")
+                self._rtc_prev_chunk = actions.detach()
             else:
                 # logging.info(f"---------------------------the first inference---------------------------------------")
                 actions = self.conditional_sample(batch_size, global_cond=global_cond)
                 actions = actions[:, start:]
                 # logging.info(f"1. the first inference actions shape: {actions.shape}")
+                self._rtc_prev_chunk = actions[:, 4:]
         else:
             # run sampling
             actions = self.conditional_sample(batch_size, global_cond=global_cond)
             end = start + self.config.n_action_steps
             actions = actions[:, start:end]
-        
-        self._rtc_prev_chunk = actions.detach()
 
         return actions
 
