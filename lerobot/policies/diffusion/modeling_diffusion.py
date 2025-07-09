@@ -140,9 +140,6 @@ class DiffusionPolicy(PreTrainedPolicy):
 
     def rtc_generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
         while not self.stop_rtc_thread:
-            # logging.info(f"self.update_ob: {self.update_ob}")
-            observation = self.get_obs()
-
             if self.update_ob is False:
                 # logging.info(f"RTC thread is waiting for update_ob to be True...")
                 time.sleep(0.01)
