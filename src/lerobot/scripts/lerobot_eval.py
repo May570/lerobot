@@ -84,6 +84,10 @@ from lerobot.processor import PolicyAction, PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
+from lerobot.utils.libero_compat import (
+    apply_rename_map_to_preprocessor,
+    resolve_libero_rename_map,
+)
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
     get_safe_torch_device,
@@ -525,10 +529,25 @@ def eval_main(cfg: EvalPipelineConfig):
 
     logging.info("Making policy.")
 
+    policy_feature_keys = []
+    if cfg.policy is not None and cfg.policy.input_features:
+        policy_feature_keys = list(cfg.policy.input_features.keys())
+    effective_rename_map = resolve_libero_rename_map(
+        enable_legacy_compat=cfg.libero_legacy_obs_compat,
+        env_cfg=cfg.env,
+        feature_keys=policy_feature_keys,
+        user_rename_map=cfg.rename_map,
+    )
+    if effective_rename_map != cfg.rename_map:
+        logging.warning(
+            "Enabled LIBERO legacy observation compatibility mapping: %s",
+            effective_rename_map,
+        )
+
     policy = make_policy(
         cfg=cfg.policy,
         env_cfg=cfg.env,
-        rename_map=cfg.rename_map,
+        rename_map=effective_rename_map,
     )
 
     policy.eval()
@@ -536,7 +555,7 @@ def eval_main(cfg: EvalPipelineConfig):
     # The inference device is automatically set to match the detected hardware, overriding any previous device settings from training to ensure compatibility.
     preprocessor_overrides = {
         "device_processor": {"device": str(policy.config.device)},
-        "rename_observations_processor": {"rename_map": cfg.rename_map},
+        "rename_observations_processor": {"rename_map": effective_rename_map},
     }
 
     preprocessor, postprocessor = make_pre_post_processors(
@@ -544,6 +563,7 @@ def eval_main(cfg: EvalPipelineConfig):
         pretrained_path=cfg.policy.pretrained_path,
         preprocessor_overrides=preprocessor_overrides,
     )
+    apply_rename_map_to_preprocessor(preprocessor, effective_rename_map)
 
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)

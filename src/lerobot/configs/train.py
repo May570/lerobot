@@ -79,6 +79,9 @@ class TrainPipelineConfig(HubMixin):
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Optional compatibility for legacy LIBERO datasets that use keys like image/wrist_image/state.
+    # Disabled by default to preserve existing behavior.
+    libero_legacy_obs_compat: bool = False
     checkpoint_path: Path | None = field(init=False, default=None)
 
     def validate(self) -> None:

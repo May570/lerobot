@@ -38,6 +38,9 @@ class EvalPipelineConfig:
     seed: int | None = 1000
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Optional compatibility for legacy LIBERO datasets that use keys like image/wrist_image/state.
+    # Disabled by default to preserve existing behavior.
+    libero_legacy_obs_compat: bool = False
     # Explicit consent to execute remote code from the Hub (required for hub environments).
     trust_remote_code: bool = False
 

@@ -167,13 +167,24 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
         A dictionary with the extracted complementary data.
     """
     pad_keys = {k: v for k, v in batch.items() if "_is_pad" in k}
+    precomputed_flow_keys = {k: v for k, v in batch.items() if k.startswith("precomputed_flow_")}
     task_key = {"task": batch["task"]} if "task" in batch else {}
     subtask_key = {"subtask": batch["subtask"]} if "subtask" in batch else {}
     index_key = {"index": batch["index"]} if "index" in batch else {}
     task_index_key = {"task_index": batch["task_index"]} if "task_index" in batch else {}
+    frame_index_key = {"frame_index": batch["frame_index"]} if "frame_index" in batch else {}
     episode_index_key = {"episode_index": batch["episode_index"]} if "episode_index" in batch else {}
 
-    return {**pad_keys, **task_key, **subtask_key, **index_key, **task_index_key, **episode_index_key}
+    return {
+        **pad_keys,
+        **precomputed_flow_keys,
+        **task_key,
+        **subtask_key,
+        **index_key,
+        **task_index_key,
+        **frame_index_key,
+        **episode_index_key,
+    }
 
 
 def create_transition(

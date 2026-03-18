@@ -71,6 +71,32 @@ class DiffusionConfig(PreTrainedConfig):
             The group sizes are set to be about 16 (to be precise, feature_dim // 16).
         spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
         use_separate_rgb_encoder_per_camera: Whether to use a separate RGB encoder for each camera view.
+        enable_optical_flow_condition: Whether to compute a lightweight hand-crafted optical flow feature
+            from consecutive observation frames and append it to the global conditioning vector.
+        optical_flow_feature_dim: Output feature dimension for the lightweight optical-flow encoder.
+        optical_flow_kernel_size: Sobel kernel size used by the hand-crafted optical-flow approximation.
+            Supported values: 3, 5, 7.
+        optical_flow_eps: Numerical stability term used in the optical-flow closed-form approximation.
+        optical_flow_gate_init: Initial scale value for a learnable scalar gate on the optical-flow feature.
+            Set close to 0 to start from near-disabled flow and let training learn how much to use.
+        optical_flow_dropout_p: Branch dropout probability applied to optical-flow conditioning during
+            training. This stochastically removes the flow branch to reduce over-reliance on noisy flow.
+        precomputed_optical_flow_root: Optional root directory containing per-episode precomputed optical
+            flow files. When set, training/inference will try to load flow from disk instead of computing
+            hand-crafted flow online. If unavailable for a batch (e.g. env rollout without dataset indices),
+            the policy falls back to online flow computation.
+        precomputed_optical_flow_cache_size: Number of episode flow files to keep in memory-mapped cache.
+        enable_online_gmflow_rollout: Whether to run GMFlow online during rollout (`select_action`) and
+            inject the result as `precomputed_flow_*` tensors for conditioning. When disabled, rollout
+            behavior is unchanged and falls back to hand-crafted online flow if needed.
+        online_gmflow_repo_path: Path to the GMFlow repository root (the folder containing `gmflow/` and
+            `utils/` modules) used for dynamic import during rollout.
+        online_gmflow_checkpoint: Path to a GMFlow checkpoint file for online rollout inference.
+        online_gmflow_use_amp: Whether to enable AMP autocast when online GMFlow runs on CUDA.
+        online_gmflow_padding_factor: Padding factor passed to GMFlow `InputPadder`.
+        online_gmflow_attn_splits_list: Attention split list passed to GMFlow forward.
+        online_gmflow_corr_radius_list: Correlation radius list passed to GMFlow forward.
+        online_gmflow_prop_radius_list: Propagation radius list passed to GMFlow forward.
         down_dims: Feature dimension for each stage of temporal downsampling in the diffusion modeling Unet.
             You may provide a variable number of dimensions, therefore also controlling the degree of
             downsampling.
@@ -128,6 +154,23 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+    # Experimental: hand-crafted optical flow conditioning.
+    enable_optical_flow_condition: bool = False
+    optical_flow_feature_dim: int = 64
+    optical_flow_kernel_size: int = 3
+    optical_flow_eps: float = 1e-3
+    optical_flow_gate_init: float = 0.1
+    optical_flow_dropout_p: float = 0.3
+    precomputed_optical_flow_root: str | None = None
+    precomputed_optical_flow_cache_size: int = 8
+    enable_online_gmflow_rollout: bool = False
+    online_gmflow_repo_path: str | None = None
+    online_gmflow_checkpoint: str | None = None
+    online_gmflow_use_amp: bool = True
+    online_gmflow_padding_factor: int = 8
+    online_gmflow_attn_splits_list: tuple[int, ...] = (2,)
+    online_gmflow_corr_radius_list: tuple[int, ...] = (-1,)
+    online_gmflow_prop_radius_list: tuple[int, ...] = (-1,)
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
@@ -181,6 +224,48 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
                 f"Got {self.noise_scheduler_type}."
+            )
+        if self.optical_flow_kernel_size not in {3, 5, 7}:
+            raise ValueError(
+                f"`optical_flow_kernel_size` must be one of (3, 5, 7). Got {self.optical_flow_kernel_size}."
+            )
+        if self.optical_flow_feature_dim <= 0:
+            raise ValueError(
+                f"`optical_flow_feature_dim` must be > 0. Got {self.optical_flow_feature_dim}."
+            )
+        if self.optical_flow_eps <= 0:
+            raise ValueError(f"`optical_flow_eps` must be > 0. Got {self.optical_flow_eps}.")
+        if not (0.0 <= self.optical_flow_gate_init <= 1.0):
+            raise ValueError(
+                "`optical_flow_gate_init` must be in [0, 1]. "
+                f"Got {self.optical_flow_gate_init}."
+            )
+        if not (0.0 <= self.optical_flow_dropout_p < 1.0):
+            raise ValueError(
+                "`optical_flow_dropout_p` must be in [0, 1). "
+                f"Got {self.optical_flow_dropout_p}."
+            )
+        if self.precomputed_optical_flow_cache_size <= 0:
+            raise ValueError(
+                "`precomputed_optical_flow_cache_size` must be > 0. "
+                f"Got {self.precomputed_optical_flow_cache_size}."
+            )
+        if self.enable_online_gmflow_rollout and not self.enable_optical_flow_condition:
+            raise ValueError(
+                "`enable_online_gmflow_rollout=True` requires `enable_optical_flow_condition=True`."
+            )
+        if self.enable_online_gmflow_rollout and not self.online_gmflow_repo_path:
+            raise ValueError(
+                "`online_gmflow_repo_path` must be set when `enable_online_gmflow_rollout=True`."
+            )
+        if self.enable_online_gmflow_rollout and not self.online_gmflow_checkpoint:
+            raise ValueError(
+                "`online_gmflow_checkpoint` must be set when `enable_online_gmflow_rollout=True`."
+            )
+        if self.online_gmflow_padding_factor <= 0:
+            raise ValueError(
+                "`online_gmflow_padding_factor` must be > 0. "
+                f"Got {self.online_gmflow_padding_factor}."
             )
 
         if self.resize_shape is not None and (

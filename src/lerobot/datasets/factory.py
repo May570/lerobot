@@ -28,6 +28,7 @@ from lerobot.datasets.lerobot_dataset import (
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
+from lerobot.utils.libero_compat import resolve_libero_rename_map
 
 IMAGENET_STATS = {
     "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
@@ -36,7 +37,9 @@ IMAGENET_STATS = {
 
 
 def resolve_delta_timestamps(
-    cfg: PreTrainedConfig, ds_meta: LeRobotDatasetMetadata
+    cfg: PreTrainedConfig,
+    ds_meta: LeRobotDatasetMetadata,
+    rename_map: dict[str, str] | None = None,
 ) -> dict[str, list] | None:
     """Resolves delta_timestamps by reading from the 'delta_indices' properties of the PreTrainedConfig.
 
@@ -55,11 +58,13 @@ def resolve_delta_timestamps(
     """
     delta_timestamps = {}
     for key in ds_meta.features:
-        if key == REWARD and cfg.reward_delta_indices is not None:
+        canonical_key = rename_map.get(key, key) if rename_map else key
+
+        if canonical_key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
-        if key == ACTION and cfg.action_delta_indices is not None:
+        if canonical_key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
-        if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
+        if canonical_key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
     if len(delta_timestamps) == 0:
@@ -88,7 +93,13 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
-        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        effective_rename_map = resolve_libero_rename_map(
+            enable_legacy_compat=cfg.libero_legacy_obs_compat,
+            env_cfg=cfg.env,
+            feature_keys=ds_meta.features.keys(),
+            user_rename_map=cfg.rename_map,
+        )
+        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta, rename_map=effective_rename_map)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
@@ -99,6 +110,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
                 tolerance_s=cfg.tolerance_s,
+                precomputed_optical_flow_root=getattr(cfg.policy, "precomputed_optical_flow_root", None),
+                precomputed_optical_flow_cache_size=getattr(cfg.policy, "precomputed_optical_flow_cache_size", 8),
             )
         else:
             dataset = StreamingLeRobotDataset(

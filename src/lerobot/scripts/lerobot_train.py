@@ -30,16 +30,22 @@ from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
-from lerobot.datasets.utils import cycle
+from lerobot.datasets.utils import cycle, dataset_to_policy_features
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
+from lerobot.processor.rename_processor import rename_stats
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
+from lerobot.utils.libero_compat import (
+    apply_rename_map_to_batch,
+    apply_rename_map_to_preprocessor,
+    resolve_libero_rename_map,
+)
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
@@ -227,6 +233,35 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    effective_rename_map = resolve_libero_rename_map(
+        enable_legacy_compat=cfg.libero_legacy_obs_compat,
+        env_cfg=cfg.env,
+        feature_keys=dataset.meta.features.keys(),
+        user_rename_map=cfg.rename_map,
+    )
+    if is_main_process and effective_rename_map != cfg.rename_map:
+        logging.warning(
+            "Enabled LIBERO legacy observation compatibility mapping: %s",
+            effective_rename_map,
+        )
+    # Compatibility path for legacy LIBERO datasets:
+    # if input feature keys are old-style (e.g. `image`, `state`), rename them
+    # to canonical policy keys before policy instantiation.
+    if effective_rename_map and not cfg.policy.input_features:
+        renamed_ds_features = {
+            effective_rename_map.get(key, key): feature for key, feature in dataset.meta.features.items()
+        }
+        ds_policy_features = dataset_to_policy_features(renamed_ds_features)
+        cfg.policy.input_features = {
+            effective_rename_map.get(key, key): feature
+            for key, feature in ds_policy_features.items()
+            if key not in {"action", "actions"}
+        }
+
+    dataset_stats_for_processor = (
+        rename_stats(dataset.meta.stats, effective_rename_map) if effective_rename_map else dataset.meta.stats
+    )
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -240,7 +275,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     policy = make_policy(
         cfg=cfg.policy,
         ds_meta=dataset.meta,
-        rename_map=cfg.rename_map,
+        rename_map=effective_rename_map,
     )
 
     if cfg.peft is not None:
@@ -257,7 +292,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     postprocessor_kwargs = {}
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
-        processor_kwargs["dataset_stats"] = dataset.meta.stats
+        processor_kwargs["dataset_stats"] = dataset_stats_for_processor
 
     # For SARM, always provide dataset_meta for progress normalization
     if cfg.policy.type == "sarm":
@@ -267,17 +302,17 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": dataset_stats_for_processor,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
             },
         }
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
-            "rename_map": cfg.rename_map
+            "rename_map": effective_rename_map
         }
         postprocessor_kwargs["postprocessor_overrides"] = {
             "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": dataset_stats_for_processor,
                 "features": policy.config.output_features,
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -289,6 +324,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+    apply_rename_map_to_preprocessor(preprocessor, effective_rename_map)
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
@@ -411,6 +447,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
+        batch = apply_rename_map_to_batch(batch, effective_rename_map)
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 

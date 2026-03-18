@@ -21,8 +21,12 @@ TODO(alexander-soare):
 """
 
 import math
-from collections import deque
+import logging
+import importlib
+import sys
+from collections import OrderedDict, deque
 from collections.abc import Callable
+from pathlib import Path
 
 import einops
 import numpy as np
@@ -42,6 +46,234 @@ from lerobot.policies.utils import (
     populate_queues,
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+
+PRECOMPUTED_FLOW_PREFIX = "precomputed_flow_"
+
+
+class PrecomputedOpticalFlowReader:
+    """Read per-episode precomputed optical flow maps and build (B,S,N,2,H,W) tensors."""
+
+    def __init__(
+        self,
+        root: str,
+        image_features: list[str],
+        n_obs_steps: int,
+        observation_delta_indices: list[int] | None,
+        cache_size: int,
+    ):
+        self.root = Path(root)
+        if not self.root.exists():
+            raise FileNotFoundError(f"Precomputed optical-flow root does not exist: {self.root}")
+
+        self.image_features = image_features
+        self.n_obs_steps = n_obs_steps
+        self.cache_size = cache_size
+        self._episode_cache: OrderedDict[int, np.lib.npyio.NpzFile] = OrderedDict()
+        self._episode_flow_key_cache: dict[int, dict[str, str]] = {}
+
+        if observation_delta_indices is not None and len(observation_delta_indices) >= n_obs_steps:
+            # Keep ordering consistent with the observation stack from dataset/preprocessor.
+            self.obs_rel_indices = list(observation_delta_indices[-n_obs_steps:])
+        else:
+            # Default fallback for diffusion policy: past observations up to current frame.
+            self.obs_rel_indices = list(range(-n_obs_steps + 1, 1))
+
+    @staticmethod
+    def _as_batch_scalar_list(x: Tensor) -> list[int]:
+        # Accept (B,), (B,1), or any tensor where first value per sample is the scalar metadata.
+        if x.ndim == 1:
+            return x.to(torch.long).cpu().tolist()
+        if x.ndim >= 2:
+            return x.reshape(x.shape[0], -1)[:, 0].to(torch.long).cpu().tolist()
+        return [int(x.item())]
+
+    @staticmethod
+    def _camera_aliases(feature_name: str) -> list[str]:
+        if "observation.images." in feature_name:
+            suffix = feature_name.split("observation.images.", maxsplit=1)[1]
+        else:
+            suffix = feature_name.split(".")[-1]
+
+        aliases = [suffix]
+        if suffix == "image2":
+            aliases.insert(0, "wrist_image")
+        if suffix == "wrist_image" and "image2" not in aliases:
+            aliases.append("image2")
+        if suffix == "image":
+            aliases.insert(0, "image")
+
+        # deduplicate preserving order
+        seen = set()
+        ordered = []
+        for a in aliases:
+            if a not in seen:
+                seen.add(a)
+                ordered.append(a)
+        return ordered
+
+    def _load_episode_npz(self, episode_index: int) -> np.lib.npyio.NpzFile:
+        if episode_index in self._episode_cache:
+            npz = self._episode_cache.pop(episode_index)
+            self._episode_cache[episode_index] = npz
+            return npz
+
+        npz_path = self.root / f"episode_{episode_index:06d}" / "flows.npz"
+        if not npz_path.exists():
+            raise FileNotFoundError(f"Missing precomputed flow file: {npz_path}")
+
+        npz = np.load(npz_path, mmap_mode="r", allow_pickle=False)
+        self._episode_cache[episode_index] = npz
+
+        while len(self._episode_cache) > self.cache_size:
+            old_episode, old_npz = self._episode_cache.popitem(last=False)
+            old_npz.close()
+            self._episode_flow_key_cache.pop(old_episode, None)
+
+        return npz
+
+    def _resolve_feature_flow_key(self, npz: np.lib.npyio.NpzFile, feature_name: str) -> str:
+        npz_keys = set(npz.files)
+        for alias in self._camera_aliases(feature_name):
+            key = f"flow_{alias}"
+            if key in npz_keys:
+                return key
+        raise KeyError(
+            f"Could not resolve flow key for feature '{feature_name}'. "
+            f"Available keys: {sorted(npz_keys)}"
+        )
+
+    def get_flow_maps(self, batch: dict[str, Tensor], ref_images: Tensor) -> Tensor:
+        required = {"index", "frame_index", "episode_index"}
+        missing = required.difference(batch.keys())
+        if missing:
+            raise KeyError(f"Missing batch keys for precomputed flow lookup: {sorted(missing)}")
+
+        b, s, n, _, h, w = ref_images.shape
+        out = torch.empty((b, s, n, 2, h, w), device=ref_images.device, dtype=ref_images.dtype)
+
+        curr_indices = self._as_batch_scalar_list(batch["index"])
+        frame_indices = self._as_batch_scalar_list(batch["frame_index"])
+        episode_indices = self._as_batch_scalar_list(batch["episode_index"])
+
+        for bi in range(b):
+            ep_idx = episode_indices[bi]
+            curr_idx = curr_indices[bi]
+            frame_idx = frame_indices[bi]
+            ep_start_idx = curr_idx - frame_idx
+
+            npz = self._load_episode_npz(ep_idx)
+            if ep_idx not in self._episode_flow_key_cache:
+                self._episode_flow_key_cache[ep_idx] = {
+                    feat: self._resolve_feature_flow_key(npz, feat) for feat in self.image_features
+                }
+
+            dataset_indices = npz["dataset_index"]
+            for si, rel in enumerate(self.obs_rel_indices):
+                target_global_idx = max(ep_start_idx, curr_idx + rel)
+                local_idx = target_global_idx - ep_start_idx
+                if local_idx < 0 or local_idx >= dataset_indices.shape[0]:
+                    raise IndexError(
+                        f"Local flow index out of range: local_idx={local_idx}, episode={ep_idx}, "
+                        f"target_global_idx={target_global_idx}, ep_start_idx={ep_start_idx}, "
+                        f"episode_len={dataset_indices.shape[0]}"
+                    )
+                if int(dataset_indices[local_idx]) != int(target_global_idx):
+                    raise ValueError(
+                        f"Flow index mismatch at episode={ep_idx}, local_idx={local_idx}: "
+                        f"dataset_index={int(dataset_indices[local_idx])} != expected={target_global_idx}"
+                    )
+
+                for ni, feat in enumerate(self.image_features):
+                    flow_key = self._episode_flow_key_cache[ep_idx][feat]
+                    flow_hw2 = npz[flow_key][local_idx]
+                    flow_2hw = torch.from_numpy(flow_hw2).to(device=ref_images.device).permute(2, 0, 1)
+                    out[bi, si, ni] = flow_2hw.to(dtype=ref_images.dtype)
+
+        return out
+
+
+class OnlineGMFlowRunner:
+    """Run GMFlow on consecutive rollout frames and return dense flow (B,2,H,W)."""
+
+    def __init__(
+        self,
+        *,
+        repo_path: str,
+        checkpoint_path: str,
+        device: torch.device,
+        use_amp: bool,
+        padding_factor: int,
+        attn_splits_list: tuple[int, ...],
+        corr_radius_list: tuple[int, ...],
+        prop_radius_list: tuple[int, ...],
+    ):
+        self.device = device
+        self.use_amp = use_amp and device.type == "cuda"
+        self.padding_factor = padding_factor
+        self.attn_splits_list = list(attn_splits_list)
+        self.corr_radius_list = list(corr_radius_list)
+        self.prop_radius_list = list(prop_radius_list)
+
+        repo_root = Path(repo_path).resolve()
+        if not repo_root.exists():
+            raise FileNotFoundError(f"GMFlow repo path does not exist: {repo_root}")
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+
+        gmflow_module = importlib.import_module("gmflow.gmflow")
+        utils_module = importlib.import_module("utils.utils")
+        gmflow_cls = getattr(gmflow_module, "GMFlow")
+        self._input_padder_cls = getattr(utils_module, "InputPadder")
+
+        # Match the architecture used by our precompute script for consistency.
+        self.model = gmflow_cls(
+            feature_channels=128,
+            num_scales=1,
+            upsample_factor=8,
+            num_head=1,
+            attention_type="swin",
+            ffn_dim_expansion=4,
+            num_transformer_layers=6,
+        ).to(device)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        weights = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+        self.model.load_state_dict(weights, strict=True)
+        self.model.eval()
+
+    @torch.no_grad()
+    def infer(self, prev_images: Tensor, curr_images: Tensor) -> Tensor:
+        """Estimate optical flow from previous to current frame."""
+        image1 = prev_images.to(device=self.device, dtype=torch.float32, non_blocking=True)
+        image2 = curr_images.to(device=self.device, dtype=torch.float32, non_blocking=True)
+
+        # Runtime observations are often normalized to [0, 1]; GMFlow checkpoints are trained on 0-255 inputs.
+        if float(image1.detach().amax()) <= 1.5 and float(image2.detach().amax()) <= 1.5:
+            image1 = image1 * 255.0
+            image2 = image2 * 255.0
+
+        padder = self._input_padder_cls(image1.shape, padding_factor=self.padding_factor)
+        image1, image2 = padder.pad(image1, image2)
+
+        if self.use_amp:
+            with torch.cuda.amp.autocast(enabled=True):
+                results = self.model(
+                    image1,
+                    image2,
+                    attn_splits_list=self.attn_splits_list,
+                    corr_radius_list=self.corr_radius_list,
+                    prop_radius_list=self.prop_radius_list,
+                )
+        else:
+            results = self.model(
+                image1,
+                image2,
+                attn_splits_list=self.attn_splits_list,
+                corr_radius_list=self.corr_radius_list,
+                prop_radius_list=self.prop_radius_list,
+            )
+
+        flow = results["flow_preds"][-1]  # (B, 2, H, W)
+        return padder.unpad(flow).contiguous()
 
 
 class DiffusionPolicy(PreTrainedPolicy):
@@ -73,6 +305,32 @@ class DiffusionPolicy(PreTrainedPolicy):
         self._queues = None
 
         self.diffusion = DiffusionModel(config)
+        self._online_gmflow_enabled = (
+            self.config.enable_online_gmflow_rollout
+            and self.config.enable_optical_flow_condition
+            and len(self.config.image_features) > 0
+        )
+        self.online_gmflow_runner = None
+        self._gmflow_prev_images: dict[str, Tensor] = {}
+        self._gmflow_flow_keys: dict[str, str] = {}
+
+        if self._online_gmflow_enabled:
+            policy_device = get_device_from_parameters(self.diffusion)
+            self.online_gmflow_runner = OnlineGMFlowRunner(
+                repo_path=self.config.online_gmflow_repo_path,
+                checkpoint_path=self.config.online_gmflow_checkpoint,
+                device=policy_device,
+                use_amp=self.config.online_gmflow_use_amp,
+                padding_factor=self.config.online_gmflow_padding_factor,
+                attn_splits_list=self.config.online_gmflow_attn_splits_list,
+                corr_radius_list=self.config.online_gmflow_corr_radius_list,
+                prop_radius_list=self.config.online_gmflow_prop_radius_list,
+            )
+            # Use canonical alias so model-side precomputed-flow resolver picks up the right camera.
+            self._gmflow_flow_keys = {
+                feat: f"{PRECOMPUTED_FLOW_PREFIX}{PrecomputedOpticalFlowReader._camera_aliases(feat)[0]}"
+                for feat in self.config.image_features
+            }
 
         self.reset()
 
@@ -89,6 +347,47 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+        if self._online_gmflow_enabled:
+            for flow_key in self._gmflow_flow_keys.values():
+                self._queues[flow_key] = deque(maxlen=self.config.n_obs_steps)
+            self._gmflow_prev_images = {}
+
+    @torch.no_grad()
+    def _attach_online_gmflow_to_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Estimate per-camera GMFlow online and attach as precomputed-flow batch keys."""
+        if not self._online_gmflow_enabled:
+            return batch
+
+        if self.online_gmflow_runner is None:
+            raise RuntimeError("Online GMFlow is enabled but the GMFlow runner is not initialized.")
+
+        out = dict(batch)
+        for feat in self.config.image_features:
+            if feat not in out:
+                continue
+
+            curr = out[feat]
+            if curr.ndim == 3:
+                curr = curr.unsqueeze(0)
+            if curr.ndim != 4:
+                raise ValueError(f"Expected 4D image tensor for '{feat}', got shape {tuple(curr.shape)}")
+
+            prev = self._gmflow_prev_images.get(feat)
+            if prev is None or tuple(prev.shape) != tuple(curr.shape):
+                # No previous frame yet (e.g. first step after reset): define zero flow.
+                flow = torch.zeros(
+                    (curr.shape[0], 2, curr.shape[-2], curr.shape[-1]), device=curr.device, dtype=curr.dtype
+                )
+            else:
+                flow = self.online_gmflow_runner.infer(prev, curr).to(device=curr.device, dtype=curr.dtype)
+
+            out[self._gmflow_flow_keys[feat]] = flow
+            # Cache the current frame for next-step flow estimation.
+            self._gmflow_prev_images[feat] = curr.detach().to(
+                device=self.online_gmflow_runner.device, dtype=torch.float32, non_blocking=True
+            )
+
+        return out
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -124,6 +423,10 @@ class DiffusionPolicy(PreTrainedPolicy):
         # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
         if ACTION in batch:
             batch.pop(ACTION)
+
+        if self._online_gmflow_enabled:
+            # Rollout-only path: compute GMFlow from consecutive observations and inject as precomputed flow.
+            batch = self._attach_online_gmflow_to_batch(batch)
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -180,6 +483,45 @@ class DiffusionModel(nn.Module):
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
+        elif self.config.enable_optical_flow_condition:
+            raise ValueError("`enable_optical_flow_condition=True` requires at least one image observation.")
+
+        if self.config.enable_optical_flow_condition and self.config.image_features:
+            # Experimental path: use a lightweight hand-crafted optical-flow encoder and concatenate
+            # the resulting feature to the denoiser global condition.
+            self.optical_flow_encoder = DiffusionOpticalFlowEncoder(config)
+            self.flow_feature_dim = self.optical_flow_encoder.feature_dim * len(self.config.image_features)
+            # Normalize flow features before fusion to keep feature scales comparable with other conditions.
+            self.optical_flow_feature_norm = nn.LayerNorm(self.flow_feature_dim)
+            # Learnable scalar gate for soft enabling of the flow branch.
+            # We optimize an unconstrained logit and map with sigmoid to [0, 1].
+            gate_init = torch.tensor(self.config.optical_flow_gate_init, dtype=torch.float32).clamp(1e-6, 1 - 1e-6)
+            self.optical_flow_gate_logit = nn.Parameter(torch.log(gate_init / (1 - gate_init)))
+            global_cond_dim += self.flow_feature_dim
+            flow_kernel_x, flow_kernel_y = _make_sobel_kernels(self.config.optical_flow_kernel_size)
+            self.register_buffer("flow_kernel_x", flow_kernel_x, persistent=False)
+            self.register_buffer("flow_kernel_y", flow_kernel_y, persistent=False)
+            if self.config.precomputed_optical_flow_root:
+                self.precomputed_optical_flow_reader = PrecomputedOpticalFlowReader(
+                    root=self.config.precomputed_optical_flow_root,
+                    image_features=list(self.config.image_features.keys()),
+                    n_obs_steps=self.config.n_obs_steps,
+                    observation_delta_indices=self.config.observation_delta_indices,
+                    cache_size=self.config.precomputed_optical_flow_cache_size,
+                )
+            else:
+                self.precomputed_optical_flow_reader = None
+            self._warned_precomputed_flow_fallback = False
+        else:
+            self.optical_flow_encoder = None
+            self.flow_feature_dim = 0
+            self.optical_flow_feature_norm = None
+            self.optical_flow_gate_logit = None
+            self.precomputed_optical_flow_reader = None
+            self._warned_precomputed_flow_fallback = False
+            self.register_buffer("flow_kernel_x", None, persistent=False)
+            self.register_buffer("flow_kernel_y", None, persistent=False)
+
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
@@ -275,11 +617,127 @@ class DiffusionModel(nn.Module):
                 )
             global_cond_feats.append(img_features)
 
+            if self.optical_flow_encoder is not None:
+                # Convert stacked frames into a simple hand-crafted optical-flow estimate, then encode
+                # flow maps into compact per-step features before concatenation.
+                flow_maps = self._get_optical_flow_maps(batch)
+                flow_features = self.optical_flow_encoder(
+                    einops.rearrange(flow_maps, "b s n c h w -> (b s n) c h w")
+                )
+                flow_features = einops.rearrange(
+                    flow_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                )
+                # Stabilize flow feature statistics and modulate strength with a learnable gate.
+                flow_features = self.optical_flow_feature_norm(flow_features)
+                flow_gate = torch.sigmoid(self.optical_flow_gate_logit).to(flow_features.dtype)
+                flow_features = flow_gate * flow_features
+                # Branch dropout: randomly remove all flow conditioning for a sample during training.
+                # This prevents the model from over-relying on potentially noisy hand-crafted flow.
+                if self.training and self.config.optical_flow_dropout_p > 0:
+                    keep_prob = 1.0 - self.config.optical_flow_dropout_p
+                    keep_mask = (
+                        torch.rand((batch_size, 1, 1), device=flow_features.device, dtype=flow_features.dtype)
+                        < keep_prob
+                    )
+                    flow_features = flow_features * keep_mask / keep_prob
+                global_cond_feats.append(flow_features)
+
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+
+    def _get_optical_flow_maps(self, batch: dict[str, Tensor]) -> Tensor:
+        """Get optical flow from precomputed cache when configured, otherwise compute online."""
+        images = batch[OBS_IMAGES]
+        flow_from_batch = self._get_precomputed_flow_maps_from_batch(batch, ref_images=images)
+        if flow_from_batch is not None:
+            return flow_from_batch
+
+        if self.precomputed_optical_flow_reader is not None:
+            try:
+                return self.precomputed_optical_flow_reader.get_flow_maps(batch, ref_images=images)
+            except KeyError:
+                # Eval rollouts typically don't carry dataset index metadata; keep compatibility by fallback.
+                if not self._warned_precomputed_flow_fallback:
+                    logging.warning(
+                        "Precomputed flow root is set but batch lacks dataset index metadata. "
+                        "Falling back to online optical-flow approximation for this run."
+                    )
+                    self._warned_precomputed_flow_fallback = True
+            except FileNotFoundError:
+                # User asked for precomputed flow; missing files should fail loudly for reproducibility.
+                raise
+            except Exception:
+                # Any data mismatch is likely a preprocessing bug and should not be silently ignored.
+                raise
+        return self._compute_approx_optical_flow(images)
+
+    def _get_precomputed_flow_maps_from_batch(self, batch: dict[str, Tensor], ref_images: Tensor) -> Tensor | None:
+        """Build flow maps from tensors already attached by dataset workers."""
+        available_keys = {k for k in batch if k.startswith(PRECOMPUTED_FLOW_PREFIX)}
+        if not available_keys:
+            return None
+
+        b, s, n, _, h, w = ref_images.shape
+        out = torch.empty((b, s, n, 2, h, w), device=ref_images.device, dtype=ref_images.dtype)
+
+        for ni, feat in enumerate(self.config.image_features):
+            flow_key = None
+            for alias in PrecomputedOpticalFlowReader._camera_aliases(feat):
+                candidate = f"{PRECOMPUTED_FLOW_PREFIX}{alias}"
+                if candidate in available_keys:
+                    flow_key = candidate
+                    break
+            if flow_key is None:
+                return None
+
+            flow = batch[flow_key]
+            if flow.ndim == 4:
+                flow = flow.unsqueeze(1)
+            if flow.shape[0] != b or flow.shape[1] != s or flow.shape[2] != 2:
+                raise ValueError(
+                    f"Unexpected precomputed flow tensor shape for key '{flow_key}': "
+                    f"got={tuple(flow.shape)}, expected=(B={b}, S={s}, 2, H, W)"
+                )
+            out[:, :, ni] = flow.to(device=ref_images.device, dtype=ref_images.dtype)
+
+        return out
+
+    def _compute_approx_optical_flow(self, images: Tensor) -> Tensor:
+        """Compute a lightweight, hand-crafted optical-flow approximation from consecutive RGB frames.
+
+        This is intentionally simple for idea validation: we use grayscale brightness constancy
+        with Sobel spatial gradients and a closed-form per-pixel update:
+            u = -It * Ix / (Ix^2 + Iy^2 + eps)
+            v = -It * Iy / (Ix^2 + Iy^2 + eps)
+        where (u, v) is the flow vector and It/Ix/Iy are temporal/spatial gradients.
+        """
+        if self.flow_kernel_x is None or self.flow_kernel_y is None:
+            raise RuntimeError("Optical-flow kernels are not initialized.")
+
+        # (B, S, N, C, H, W) -> (B, S, N, H, W), grayscale for gradient computation.
+        gray_images = (
+            0.2989 * images[..., 0, :, :] + 0.5870 * images[..., 1, :, :] + 0.1140 * images[..., 2, :, :]
+        )
+        # Use previous frame for temporal derivative; first step is copied so its flow is exactly zero.
+        prev_gray_images = torch.cat([gray_images[:, :1], gray_images[:, :-1]], dim=1)
+
+        flat_gray_images = einops.rearrange(gray_images, "b s n h w -> (b s n) 1 h w")
+        flat_prev_gray_images = einops.rearrange(prev_gray_images, "b s n h w -> (b s n) 1 h w")
+
+        padding = self.flow_kernel_x.shape[-1] // 2
+        grad_x = F.conv2d(flat_gray_images, self.flow_kernel_x.to(flat_gray_images), padding=padding)
+        grad_y = F.conv2d(flat_gray_images, self.flow_kernel_y.to(flat_gray_images), padding=padding)
+        grad_t = flat_gray_images - flat_prev_gray_images
+
+        denom = grad_x.square() + grad_y.square() + self.config.optical_flow_eps
+        flow_x = -grad_t * grad_x / denom
+        flow_y = -grad_t * grad_y / denom
+        flow = torch.cat([flow_x, flow_y], dim=1)
+
+        return einops.rearrange(flow, "(b s n) c h w -> b s n c h w", b=images.shape[0], s=images.shape[1])
 
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """
@@ -323,7 +781,10 @@ class DiffusionModel(nn.Module):
         }
         """
         # Input validation.
-        assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
+        required_keys = {OBS_STATE, ACTION}
+        if self.config.do_mask_loss_for_padding:
+            required_keys.add("action_is_pad")
+        assert set(batch).issuperset(required_keys)
         assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
         n_obs_steps = batch[OBS_STATE].shape[1]
         horizon = batch[ACTION].shape[1]
@@ -372,6 +833,28 @@ class DiffusionModel(nn.Module):
             loss = loss * in_episode_bound.unsqueeze(-1)
 
         return loss.mean()
+
+
+def _make_sobel_kernels(kernel_size: int) -> tuple[Tensor, Tensor]:
+    """Build Sobel-like derivative kernels of size 3/5/7 for manual optical-flow estimation."""
+    if kernel_size == 3:
+        smoothing = torch.tensor([1.0, 2.0, 1.0])
+        derivative = torch.tensor([-1.0, 0.0, 1.0])
+    elif kernel_size == 5:
+        smoothing = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0])
+        derivative = torch.tensor([-1.0, -2.0, 0.0, 2.0, 1.0])
+    elif kernel_size == 7:
+        smoothing = torch.tensor([1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0])
+        derivative = torch.tensor([-1.0, -4.0, -5.0, 0.0, 5.0, 4.0, 1.0])
+    else:
+        raise ValueError(f"Unsupported Sobel kernel size: {kernel_size}")
+
+    kernel_x = torch.outer(smoothing, derivative)
+    kernel_y = torch.outer(derivative, smoothing)
+    # Keep magnitudes in a stable range.
+    kernel_x = kernel_x / kernel_x.abs().sum()
+    kernel_y = kernel_y / kernel_y.abs().sum()
+    return kernel_x.view(1, 1, kernel_size, kernel_size), kernel_y.view(1, 1, kernel_size, kernel_size)
 
 
 class SpatialSoftmax(nn.Module):
@@ -531,6 +1014,34 @@ class DiffusionRgbEncoder(nn.Module):
         # Final linear layer with non-linearity.
         x = self.relu(self.out(x))
         return x
+
+
+class DiffusionOpticalFlowEncoder(nn.Module):
+    """Lightweight CNN encoder for hand-crafted optical-flow maps."""
+
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        self.feature_dim = config.optical_flow_feature_dim
+        self.backbone = nn.Sequential(
+            nn.Conv2d(2, 16, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.proj = nn.Linear(64, self.feature_dim)
+
+    def forward(self, flow_map: Tensor) -> Tensor:
+        """
+        Args:
+            flow_map: (B, 2, H, W) optical-flow tensor.
+        Returns:
+            (B, D) encoded flow feature.
+        """
+        x = self.backbone(flow_map).flatten(start_dim=1)
+        return self.proj(x)
 
 
 def _replace_submodules(
