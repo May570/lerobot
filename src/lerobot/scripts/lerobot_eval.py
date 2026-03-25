@@ -81,7 +81,7 @@ from lerobot.envs.utils import (
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
-from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
+from lerobot.utils.constants import ACTION, DONE, OBS_STATE, OBS_STATE_RAW, OBS_STR, REWARD
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.libero_compat import (
@@ -106,6 +106,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    rollout_fps: float | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -175,8 +176,29 @@ def rollout(
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
+        raw_state_for_kalman = None
+        if OBS_STATE in observation:
+            raw_state_for_kalman = observation[OBS_STATE].detach().clone()
 
         observation = preprocessor(observation)
+        # For stateful online Kalman rollout, keep an explicit unnormalized state copy.
+        if raw_state_for_kalman is not None and OBS_STATE in observation:
+            raw_state_for_kalman = raw_state_for_kalman.to(
+                device=observation[OBS_STATE].device, dtype=observation[OBS_STATE].dtype
+            )
+            observation[OBS_STATE_RAW] = raw_state_for_kalman
+        # Inject deterministic rollout timestamps based on env fps for stable dt.
+        if rollout_fps is not None and rollout_fps > 0 and OBS_STATE in observation:
+            batch_size = int(observation[OBS_STATE].shape[0])
+            obs_state = observation[OBS_STATE]
+            ts = torch.full(
+                (batch_size,),
+                float(step) / float(rollout_fps),
+                device=obs_state.device,
+                dtype=obs_state.dtype,
+            )
+            observation["timestamp"] = ts
+
         with torch.inference_mode():
             action = policy.select_action(observation)
         action = postprocessor(action)
@@ -263,6 +285,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    rollout_fps: float | None = None,
 ) -> dict:
     """
     Args:
@@ -350,6 +373,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            rollout_fps=rollout_fps,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -581,6 +605,7 @@ def eval_main(cfg: EvalPipelineConfig):
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            rollout_fps=getattr(cfg.env, "fps", None),
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -623,6 +648,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    rollout_fps: float | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -640,6 +666,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        rollout_fps=rollout_fps,
     )
 
     per_episode = task_result["per_episode"]
@@ -666,6 +693,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    rollout_fps: float | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -690,6 +718,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        rollout_fps=rollout_fps,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -711,6 +740,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    rollout_fps: float | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -766,6 +796,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        rollout_fps=rollout_fps,
     )
 
     if max_parallel_tasks <= 1:

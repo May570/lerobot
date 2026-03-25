@@ -23,7 +23,9 @@ TODO(alexander-soare):
 import math
 import logging
 import importlib
+import json
 import sys
+from dataclasses import dataclass
 from collections import OrderedDict, deque
 from collections.abc import Callable
 from pathlib import Path
@@ -36,6 +38,7 @@ import torchvision
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
+from torchvision.ops import box_convert
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -45,9 +48,10 @@ from lerobot.policies.utils import (
     get_output_shape,
     populate_queues,
 )
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE, OBS_STATE_RAW
 
 PRECOMPUTED_FLOW_PREFIX = "precomputed_flow_"
+PRECOMPUTED_KALMAN_PREFIX = "precomputed_kalman_"
 
 
 class PrecomputedOpticalFlowReader:
@@ -68,7 +72,7 @@ class PrecomputedOpticalFlowReader:
         self.image_features = image_features
         self.n_obs_steps = n_obs_steps
         self.cache_size = cache_size
-        self._episode_cache: OrderedDict[int, np.lib.npyio.NpzFile] = OrderedDict()
+        self._episode_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
         self._episode_flow_key_cache: dict[int, dict[str, str]] = {}
 
         if observation_delta_indices is not None and len(observation_delta_indices) >= n_obs_steps:
@@ -111,35 +115,40 @@ class PrecomputedOpticalFlowReader:
                 ordered.append(a)
         return ordered
 
-    def _load_episode_npz(self, episode_index: int) -> np.lib.npyio.NpzFile:
+    def _load_episode_arrays(self, episode_index: int) -> dict[str, np.ndarray]:
         if episode_index in self._episode_cache:
-            npz = self._episode_cache.pop(episode_index)
-            self._episode_cache[episode_index] = npz
-            return npz
+            arrays = self._episode_cache.pop(episode_index)
+            self._episode_cache[episode_index] = arrays
+            return arrays
 
-        npz_path = self.root / f"episode_{episode_index:06d}" / "flows.npz"
-        if not npz_path.exists():
-            raise FileNotFoundError(f"Missing precomputed flow file: {npz_path}")
+        ep_dir = self.root / f"episode_{episode_index:06d}"
+        index_path = ep_dir / "arrays.json"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Missing precomputed flow metadata file: {index_path}")
+        with index_path.open("r", encoding="utf-8") as f:
+            metadata = json.load(f)
 
-        npz = np.load(npz_path, mmap_mode="r", allow_pickle=False)
-        self._episode_cache[episode_index] = npz
+        arrays = {
+            key: np.load(ep_dir / f"{key}.npy", mmap_mode="r", allow_pickle=False)
+            for key in metadata.keys()
+        }
+        self._episode_cache[episode_index] = arrays
 
         while len(self._episode_cache) > self.cache_size:
-            old_episode, old_npz = self._episode_cache.popitem(last=False)
-            old_npz.close()
+            old_episode, _ = self._episode_cache.popitem(last=False)
             self._episode_flow_key_cache.pop(old_episode, None)
 
-        return npz
+        return arrays
 
-    def _resolve_feature_flow_key(self, npz: np.lib.npyio.NpzFile, feature_name: str) -> str:
-        npz_keys = set(npz.files)
+    def _resolve_feature_flow_key(self, arrays: dict[str, np.ndarray], feature_name: str) -> str:
+        array_keys = set(arrays.keys())
         for alias in self._camera_aliases(feature_name):
             key = f"flow_{alias}"
-            if key in npz_keys:
+            if key in array_keys:
                 return key
         raise KeyError(
             f"Could not resolve flow key for feature '{feature_name}'. "
-            f"Available keys: {sorted(npz_keys)}"
+            f"Available keys: {sorted(array_keys)}"
         )
 
     def get_flow_maps(self, batch: dict[str, Tensor], ref_images: Tensor) -> Tensor:
@@ -161,13 +170,13 @@ class PrecomputedOpticalFlowReader:
             frame_idx = frame_indices[bi]
             ep_start_idx = curr_idx - frame_idx
 
-            npz = self._load_episode_npz(ep_idx)
+            arrays = self._load_episode_arrays(ep_idx)
             if ep_idx not in self._episode_flow_key_cache:
                 self._episode_flow_key_cache[ep_idx] = {
-                    feat: self._resolve_feature_flow_key(npz, feat) for feat in self.image_features
+                    feat: self._resolve_feature_flow_key(arrays, feat) for feat in self.image_features
                 }
 
-            dataset_indices = npz["dataset_index"]
+            dataset_indices = arrays["dataset_index"]
             for si, rel in enumerate(self.obs_rel_indices):
                 target_global_idx = max(ep_start_idx, curr_idx + rel)
                 local_idx = target_global_idx - ep_start_idx
@@ -185,10 +194,129 @@ class PrecomputedOpticalFlowReader:
 
                 for ni, feat in enumerate(self.image_features):
                     flow_key = self._episode_flow_key_cache[ep_idx][feat]
-                    flow_hw2 = npz[flow_key][local_idx]
+                    flow_hw2 = arrays[flow_key][local_idx]
                     flow_2hw = torch.from_numpy(flow_hw2).to(device=ref_images.device).permute(2, 0, 1)
                     out[bi, si, ni] = flow_2hw.to(dtype=ref_images.dtype)
 
+        return out
+
+
+class PrecomputedKalmanReader:
+    """Read per-episode precomputed Kalman features and build (B,S,D) tensors."""
+
+    def __init__(
+        self,
+        root: str,
+        n_obs_steps: int,
+        observation_delta_indices: list[int] | None,
+        cache_size: int,
+        feature_mode: str,
+    ):
+        self.root = Path(root)
+        if not self.root.exists():
+            raise FileNotFoundError(f"Precomputed Kalman root does not exist: {self.root}")
+        self.n_obs_steps = n_obs_steps
+        self.cache_size = cache_size
+        self.feature_mode = feature_mode
+        self.raw_dim = 10 if self.feature_mode == "full10" else 6
+        self._episode_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
+
+        if observation_delta_indices is not None and len(observation_delta_indices) >= n_obs_steps:
+            self.obs_rel_indices = list(observation_delta_indices[-n_obs_steps:])
+        else:
+            self.obs_rel_indices = list(range(-n_obs_steps + 1, 1))
+
+    @staticmethod
+    def _as_batch_scalar_list(x: Tensor) -> list[int]:
+        if x.ndim == 1:
+            return x.to(torch.long).cpu().tolist()
+        if x.ndim >= 2:
+            return x.reshape(x.shape[0], -1)[:, 0].to(torch.long).cpu().tolist()
+        return [int(x.item())]
+
+    def _load_episode_arrays(self, episode_index: int) -> dict[str, np.ndarray]:
+        if episode_index in self._episode_cache:
+            arrays = self._episode_cache.pop(episode_index)
+            self._episode_cache[episode_index] = arrays
+            return arrays
+
+        ep_dir = self.root / f"episode_{episode_index:06d}"
+        index_path = ep_dir / "arrays.json"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Missing precomputed Kalman metadata file: {index_path}")
+        with index_path.open("r", encoding="utf-8") as f:
+            metadata = json.load(f)
+
+        required = {"dataset_index", "kalman_pos", "kalman_vel"}
+        if self.feature_mode == "full10":
+            required.add("kalman_pred_exec")
+        missing = required.difference(metadata.keys())
+        if missing:
+            raise KeyError(
+                f"Missing required Kalman keys in {index_path}: {sorted(missing)}. "
+                f"Available: {sorted(metadata.keys())}"
+            )
+
+        arrays = {
+            key: np.load(ep_dir / f"{key}.npy", mmap_mode="r", allow_pickle=False) for key in metadata.keys()
+        }
+        self._episode_cache[episode_index] = arrays
+        while len(self._episode_cache) > self.cache_size:
+            self._episode_cache.popitem(last=False)
+        return arrays
+
+    def get_kalman_features(self, batch: dict[str, Tensor], ref_state: Tensor) -> Tensor:
+        required = {"index", "frame_index", "episode_index"}
+        missing = required.difference(batch.keys())
+        if missing:
+            raise KeyError(f"Missing batch keys for precomputed Kalman lookup: {sorted(missing)}")
+
+        b, s = ref_state.shape[:2]
+        out = torch.empty((b, s, self.raw_dim), device=ref_state.device, dtype=ref_state.dtype)
+
+        curr_indices = self._as_batch_scalar_list(batch["index"])
+        frame_indices = self._as_batch_scalar_list(batch["frame_index"])
+        episode_indices = self._as_batch_scalar_list(batch["episode_index"])
+
+        for bi in range(b):
+            ep_idx = episode_indices[bi]
+            curr_idx = curr_indices[bi]
+            frame_idx = frame_indices[bi]
+            ep_start_idx = curr_idx - frame_idx
+            arrays = self._load_episode_arrays(ep_idx)
+            dataset_indices = arrays["dataset_index"]
+
+            for si, rel in enumerate(self.obs_rel_indices):
+                target_global_idx = max(ep_start_idx, curr_idx + rel)
+                local_idx = target_global_idx - ep_start_idx
+                if local_idx < 0 or local_idx >= dataset_indices.shape[0]:
+                    raise IndexError(
+                        f"Local Kalman index out of range: local_idx={local_idx}, episode={ep_idx}, "
+                        f"target_global_idx={target_global_idx}, ep_start_idx={ep_start_idx}, "
+                        f"episode_len={dataset_indices.shape[0]}"
+                    )
+                if int(dataset_indices[local_idx]) != int(target_global_idx):
+                    raise ValueError(
+                        f"Kalman index mismatch at episode={ep_idx}, local_idx={local_idx}: "
+                        f"dataset_index={int(dataset_indices[local_idx])} != expected={target_global_idx}"
+                    )
+
+                pos = torch.from_numpy(arrays["kalman_pos"][local_idx]).to(device=ref_state.device)
+                vel = torch.from_numpy(arrays["kalman_vel"][local_idx]).to(device=ref_state.device)
+                if self.feature_mode == "full10":
+                    pred = torch.from_numpy(arrays["kalman_pred_exec"][local_idx]).to(device=ref_state.device)
+                    if "kalman_valid" in arrays:
+                        valid = float(arrays["kalman_valid"][local_idx])
+                    else:
+                        valid = 1.0
+                    feat = torch.cat(
+                        [pos.to(dtype=ref_state.dtype), vel.to(dtype=ref_state.dtype), pred.to(dtype=ref_state.dtype)]
+                    )
+                    out[bi, si, :9] = feat
+                    out[bi, si, 9] = torch.tensor(valid, device=ref_state.device, dtype=ref_state.dtype)
+                else:
+                    out[bi, si, :3] = pos.to(dtype=ref_state.dtype)
+                    out[bi, si, 3:6] = vel.to(dtype=ref_state.dtype)
         return out
 
 
@@ -276,6 +404,409 @@ class OnlineGMFlowRunner:
         return padder.unpad(flow).contiguous()
 
 
+@dataclass
+class _MaskTrackState:
+    prev_box_xyxy: np.ndarray | None = None
+    prev_mask: np.ndarray | None = None
+    miss_count: int = 0
+
+
+@dataclass
+class _OnlineKalmanRuntimeState:
+    """Per-environment runtime cache for rollout-time stateful online Kalman."""
+
+    x: Tensor | None = None
+    p: Tensor | None = None
+    prev_timestamp: float | None = None
+    step_count: int = 0
+
+
+class OnlineGroundedSAM2MaskRunner:
+    """Compute rollout-time local masks using Grounded-DINO + SAM2 with fixed precompute-aligned params."""
+
+    # Keep constants aligned with:
+    # /share/project/wujiling/datasets/libero_flow_gmflow_f16_local_npy_temporal_v2/conversion_summary.json
+    GROUNDEDSAM2_ROOT = "/share/project/wujiling/Grounded-SAM-2"
+    SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    SAM2_CHECKPOINT = "/share/project/wujiling/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt"
+    GROUNDING_DINO_CONFIG = "grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+    GROUNDING_DINO_CHECKPOINT = (
+        "/share/project/wujiling/Grounded-SAM-2/gdino_checkpoints/groundingdino_swint_ogc.pth"
+    )
+    BOX_THRESHOLD = 0.28
+    TEXT_THRESHOLD = 0.22
+    ARM_PROMPT = "robotic arm. gripper. end effector."
+    TEMPORAL_IOU_THRESHOLD = 0.2
+    TEMPORAL_HOLD_FRAMES = 3
+    TEMPORAL_BOX_EMA = 0.6
+    BOX_AREA_MIN_RATIO = 0.005
+    BOX_AREA_MAX_RATIO = 0.6
+    MASK_KEEP_COMPONENTS = 2
+    MASK_BORDER_MARGIN = 8
+    MASK_CLOSE_KERNEL = 3
+    LOCALIZE_CAMERAS = {"image"}
+
+    def __init__(self, *, device: torch.device):
+        repo_root = Path(self.GROUNDEDSAM2_ROOT).resolve()
+        if not repo_root.exists():
+            raise FileNotFoundError(f"Grounded-SAM-2 root does not exist: {repo_root}")
+
+        try:
+            import cv2 as _cv2
+        except Exception as exc:
+            raise ImportError(
+                "OpenCV (`cv2`) is required for online Grounded-SAM2 masking during rollout."
+            ) from exc
+        self.cv2 = _cv2
+
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+
+        try:
+            from grounding_dino.groundingdino.util.inference import Model as GroundingDinoModel
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+        except Exception as exc:
+            raise ImportError(
+                "Failed to import Grounded-SAM2 dependencies. "
+                "Please ensure Grounded-SAM-2 and its Python dependencies are installed."
+            ) from exc
+
+        self.device = device
+        self._states: dict[str, list[_MaskTrackState]] = {}
+        self._caption = self.ARM_PROMPT.lower().strip()
+        if not self._caption.endswith("."):
+            self._caption += "."
+
+        # GroundingDINO accepts string device argument.
+        self.grounding_model = GroundingDinoModel(
+            model_config_path=str(repo_root / self.GROUNDING_DINO_CONFIG),
+            model_checkpoint_path=str(repo_root / self.GROUNDING_DINO_CHECKPOINT),
+            device=str(device),
+        )
+        # SAM2 expects config path relative to sam2 repo package.
+        sam2_cfg_name = self.SAM2_CONFIG
+        if sam2_cfg_name.startswith("sam2/"):
+            sam2_cfg_name = sam2_cfg_name[len("sam2/") :]
+        sam2_model = build_sam2(sam2_cfg_name, self.SAM2_CHECKPOINT, device=device)
+        self.sam2_predictor = SAM2ImagePredictor(sam2_model)
+
+    def reset(self) -> None:
+        self._states = {}
+
+    @staticmethod
+    def _to_uint8_rgb_tensor(image: Tensor) -> Tensor:
+        """Convert tensor image (C,H,W) to uint8 RGB tensor (C,H,W)."""
+        x = image.detach().to(device="cpu", dtype=torch.float32)
+        if x.ndim != 3:
+            raise ValueError(f"Expected image tensor with shape (C,H,W), got {tuple(x.shape)}")
+        # If normalized to [0,1], rescale to [0,255]. Otherwise clamp directly.
+        scale = 255.0 if float(x.amax()) <= 1.5 else 1.0
+        return (x * scale).clamp(0.0, 255.0).to(torch.uint8)
+
+    @staticmethod
+    def _tensor_rgb_to_numpy_hwc(rgb_chw_u8: Tensor) -> np.ndarray:
+        return rgb_chw_u8.permute(1, 2, 0).contiguous().numpy()
+
+    @staticmethod
+    def _resize_shortest_edge(
+        x: Tensor,
+        *,
+        target_short_edge: int,
+        max_size: int,
+    ) -> Tensor:
+        """Resize BCHW tensor like GroundingDINO RandomResize([800], max_size=1333)."""
+        _, _, h, w = x.shape
+        min_orig = float(min(h, w))
+        max_orig = float(max(h, w))
+        size = float(target_short_edge)
+        if (max_orig / min_orig) * size > float(max_size):
+            size = float(round(float(max_size) * min_orig / max_orig))
+        if (w <= h and int(round(w)) == int(round(size))) or (h <= w and int(round(h)) == int(round(size))):
+            out_h, out_w = h, w
+        elif w < h:
+            out_w = int(round(size))
+            out_h = int(round(size * h / w))
+        else:
+            out_h = int(round(size))
+            out_w = int(round(size * w / h))
+        if out_h == h and out_w == w:
+            return x
+        return F.interpolate(x, size=(out_h, out_w), mode="bilinear", align_corners=False)
+
+    def _predict_boxes_fast_tensor(self, rgb_chw_u8: Tensor) -> tuple[np.ndarray, np.ndarray]:
+        """GroundingDINO forward without phrase extraction/token post-processing, tensor path."""
+        # Match preprocess: ToTensor + RandomResize([800], max_size=1333) + Normalize
+        x = rgb_chw_u8.to(device=self.grounding_model.device, dtype=torch.float32).unsqueeze(0) / 255.0
+        x = self._resize_shortest_edge(x, target_short_edge=800, max_size=1333)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device, dtype=x.dtype)[None, :, None, None]
+        std = torch.tensor([0.229, 0.224, 0.225], device=x.device, dtype=x.dtype)[None, :, None, None]
+        processed = (x - mean) / std
+
+        with torch.no_grad():
+            outputs = self.grounding_model.model(processed, captions=[self._caption])
+
+        pred_logits = outputs["pred_logits"].sigmoid()[0]  # (num_queries, 256)
+        pred_boxes = outputs["pred_boxes"][0]  # (num_queries, 4) in cxcywh normalized
+        conf = pred_logits.max(dim=1)[0]
+        keep = conf > float(self.BOX_THRESHOLD)
+        if int(keep.sum().item()) == 0:
+            return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+
+        boxes_norm = pred_boxes[keep]
+        conf_keep = conf[keep]
+        _, h, w = rgb_chw_u8.shape
+        scale = torch.tensor([w, h, w, h], device=boxes_norm.device, dtype=boxes_norm.dtype)
+        boxes_xyxy = box_convert(boxes=boxes_norm * scale, in_fmt="cxcywh", out_fmt="xyxy")
+        return (
+            boxes_xyxy.detach().to(device="cpu", dtype=torch.float32).numpy(),
+            conf_keep.detach().to(device="cpu", dtype=torch.float32).numpy(),
+        )
+
+    def _predict_boxes_fast(self, image_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """GroundingDINO fast forward on legacy numpy path (fallback only)."""
+        processed = self.grounding_model.preprocess_image(image_bgr=image_bgr).to(self.grounding_model.device)
+        with torch.no_grad():
+            outputs = self.grounding_model.model(processed[None], captions=[self._caption])
+
+        pred_logits = outputs["pred_logits"].sigmoid()[0]
+        pred_boxes = outputs["pred_boxes"][0]
+        conf = pred_logits.max(dim=1)[0]
+        keep = conf > float(self.BOX_THRESHOLD)
+        if int(keep.sum().item()) == 0:
+            return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+
+        boxes_norm = pred_boxes[keep]
+        conf_keep = conf[keep]
+        h, w = image_bgr.shape[:2]
+        scale = torch.tensor([w, h, w, h], device=boxes_norm.device, dtype=boxes_norm.dtype)
+        boxes_xyxy = box_convert(boxes=boxes_norm * scale, in_fmt="cxcywh", out_fmt="xyxy")
+        return (
+            boxes_xyxy.detach().to(device="cpu", dtype=torch.float32).numpy(),
+            conf_keep.detach().to(device="cpu", dtype=torch.float32).numpy(),
+        )
+
+    def _sam2_set_image_from_tensor(self, rgb_chw_u8: Tensor) -> None:
+        """Set SAM2 predictor image embedding from tensor path to avoid numpy/PIL bridge."""
+        if rgb_chw_u8.ndim != 3 or rgb_chw_u8.shape[0] != 3:
+            raise ValueError(f"Expected RGB tensor in CHW, got {tuple(rgb_chw_u8.shape)}")
+
+        predictor = self.sam2_predictor
+        predictor.reset_predictor()
+        h, w = int(rgb_chw_u8.shape[1]), int(rgb_chw_u8.shape[2])
+        predictor._orig_hw = [(h, w)]
+        predictor._is_batch = False
+
+        # SAM2 transforms: Resize(resolution,resolution) + Normalize
+        image = rgb_chw_u8.to(device=predictor.device, dtype=torch.float32) / 255.0
+        input_image = predictor._transforms.transforms(image).unsqueeze(0)
+        backbone_out = predictor.model.forward_image(input_image)
+        _, vision_feats, _, _ = predictor.model._prepare_backbone_features(backbone_out)
+        if predictor.model.directly_add_no_mem_embed:
+            vision_feats[-1] = vision_feats[-1] + predictor.model.no_mem_embed
+
+        feats = [
+            feat.permute(1, 2, 0).view(1, -1, *feat_size)
+            for feat, feat_size in zip(vision_feats[::-1], predictor._bb_feat_sizes[::-1])
+        ][::-1]
+        predictor._features = {"image_embed": feats[-1], "high_res_feats": feats[:-1]}
+        predictor._is_image_set = True
+
+    @staticmethod
+    def _clip_box_xyxy(box: np.ndarray, height: int, width: int) -> np.ndarray:
+        x1, y1, x2, y2 = box.astype(np.float32).tolist()
+        x1 = min(max(x1, 0.0), width - 1.0)
+        x2 = min(max(x2, 0.0), width - 1.0)
+        y1 = min(max(y1, 0.0), height - 1.0)
+        y2 = min(max(y2, 0.0), height - 1.0)
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+        return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+    @staticmethod
+    def _box_iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+        ax1, ay1, ax2, ay2 = a.astype(np.float32).tolist()
+        bx1, by1, bx2, by2 = b.astype(np.float32).tolist()
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        iw = max(0.0, ix2 - ix1)
+        ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+        if union <= 0:
+            return 0.0
+        return float(inter / union)
+
+    def _refine_mask_components(self, mask_u8: np.ndarray, prev_mask_u8: np.ndarray | None) -> np.ndarray:
+        if mask_u8.max() == 0:
+            return mask_u8.astype(np.uint8)
+
+        num, labels, stats, _ = self.cv2.connectedComponentsWithStats(mask_u8.astype(np.uint8), connectivity=8)
+        if num <= 2:
+            refined = mask_u8.astype(np.uint8)
+        else:
+            h, w = mask_u8.shape
+            margin = max(1, int(self.MASK_BORDER_MARGIN))
+            border = np.zeros((h, w), dtype=np.bool_)
+            border[:margin, :] = True
+            border[-margin:, :] = True
+            border[:, :margin] = True
+            border[:, -margin:] = True
+            prev = prev_mask_u8.astype(bool) if prev_mask_u8 is not None else None
+
+            candidates: list[tuple[float, int]] = []
+            for cid in range(1, num):
+                area = int(stats[cid, self.cv2.CC_STAT_AREA])
+                if area <= 0:
+                    continue
+                comp = labels == cid
+                touches_border = bool(np.any(comp & border))
+                if prev is not None:
+                    inter = int(np.logical_and(comp, prev).sum())
+                    union = int(np.logical_or(comp, prev).sum())
+                    prev_sum = int(prev.sum())
+                    iou_prev = (inter / union) if union > 0 else 0.0
+                    overlap_prev = (inter / prev_sum) if prev_sum > 0 else 0.0
+                else:
+                    iou_prev = 0.0
+                    overlap_prev = 0.0
+                score = (
+                    2.0 * iou_prev
+                    + 1.2 * overlap_prev
+                    + (0.8 if touches_border else 0.0)
+                    + 0.05 * float(np.log1p(area))
+                )
+                candidates.append((score, cid))
+
+            if not candidates:
+                refined = mask_u8.astype(np.uint8)
+            else:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                keep_n = max(1, min(int(self.MASK_KEEP_COMPONENTS), len(candidates)))
+                refined = np.zeros_like(mask_u8, dtype=np.uint8)
+                for _, cid in candidates[:keep_n]:
+                    refined[labels == cid] = 1
+
+        if self.MASK_CLOSE_KERNEL > 1:
+            k = np.ones((self.MASK_CLOSE_KERNEL, self.MASK_CLOSE_KERNEL), dtype=np.uint8)
+            refined = self.cv2.morphologyEx(refined, self.cv2.MORPH_CLOSE, k, iterations=1)
+        return refined.astype(np.uint8)
+
+    @classmethod
+    def _is_localized_camera(cls, feature_name: str) -> bool:
+        return any(alias in cls.LOCALIZE_CAMERAS for alias in PrecomputedOpticalFlowReader._camera_aliases(feature_name))
+
+    def _ensure_states(self, feature_name: str, batch_size: int) -> list[_MaskTrackState]:
+        states = self._states.get(feature_name)
+        if states is None or len(states) != batch_size:
+            states = [_MaskTrackState() for _ in range(batch_size)]
+            self._states[feature_name] = states
+        return states
+
+    def infer_mask(self, feature_name: str, images: Tensor) -> Tensor:
+        """Return rollout mask (B,H,W) in float32 for the provided camera feature."""
+        if images.ndim != 4:
+            raise ValueError(f"Expected image tensor with shape (B,C,H,W), got {tuple(images.shape)}")
+
+        bsz, _, h, w = images.shape
+        if not self._is_localized_camera(feature_name):
+            return torch.ones((bsz, h, w), device=images.device, dtype=torch.float32)
+
+        masks = torch.zeros((bsz, h, w), device=images.device, dtype=torch.float32)
+        states = self._ensure_states(feature_name, bsz)
+
+        for bi in range(bsz):
+            state = states[bi]
+            rgb_u8 = self._to_uint8_rgb_tensor(images[bi])
+            _, img_h, img_w = rgb_u8.shape
+            # Force the legacy numpy/cv2 bridge path for A/B timing comparison.
+            # This intentionally disables the new tensor-direct fast path.
+            rgb = self._tensor_rgb_to_numpy_hwc(rgb_u8)
+            bgr = rgb[..., ::-1]
+            det_boxes, det_conf = self._predict_boxes_fast(image_bgr=bgr)
+            self.sam2_predictor.set_image(rgb)
+
+            filtered_boxes: list[np.ndarray] = []
+            filtered_conf: list[float] = []
+            if det_boxes is not None and len(det_boxes) > 0:
+                for k, box in enumerate(np.asarray(det_boxes, dtype=np.float32)):
+                    box = self._clip_box_xyxy(box, img_h, img_w)
+                    bw = max(0.0, float(box[2] - box[0]))
+                    bh = max(0.0, float(box[3] - box[1]))
+                    area_ratio = (bw * bh) / float(img_h * img_w)
+                    if area_ratio < self.BOX_AREA_MIN_RATIO or area_ratio > self.BOX_AREA_MAX_RATIO:
+                        continue
+                    filtered_boxes.append(box)
+                    conf_k = float(det_conf[k]) if det_conf is not None else 0.0
+                    filtered_conf.append(conf_k)
+
+            chosen_box: np.ndarray | None = None
+            used_hold = False
+            if filtered_boxes:
+                if state.prev_box_xyxy is not None:
+                    ious = [self._box_iou_xyxy(box, state.prev_box_xyxy) for box in filtered_boxes]
+                    best_iou_idx = int(np.argmax(np.asarray(ious)))
+                    if ious[best_iou_idx] >= self.TEMPORAL_IOU_THRESHOLD:
+                        chosen_box = filtered_boxes[best_iou_idx]
+                    else:
+                        best_conf_idx = int(np.argmax(np.asarray(filtered_conf)))
+                        chosen_box = filtered_boxes[best_conf_idx]
+                else:
+                    best_conf_idx = int(np.argmax(np.asarray(filtered_conf)))
+                    chosen_box = filtered_boxes[best_conf_idx]
+            elif state.prev_box_xyxy is not None and state.miss_count < self.TEMPORAL_HOLD_FRAMES:
+                chosen_box = state.prev_box_xyxy.copy()
+                used_hold = True
+                state.miss_count += 1
+            else:
+                state.prev_mask = None
+                state.miss_count = min(state.miss_count + 1, self.TEMPORAL_HOLD_FRAMES + 1)
+                continue
+
+            pred_masks, _, _ = self.sam2_predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=np.asarray(chosen_box, dtype=np.float32)[None, :],
+                multimask_output=False,
+            )
+            if pred_masks.ndim == 4:
+                pred_masks = np.squeeze(pred_masks, axis=1)
+            if pred_masks.ndim != 3:
+                raise ValueError(f"Unexpected SAM2 mask shape: {pred_masks.shape}")
+
+            union_mask = np.any(pred_masks, axis=0).astype(np.uint8)
+            union_mask = self._refine_mask_components(union_mask, state.prev_mask)
+            if state.prev_mask is not None and not used_hold:
+                prev = state.prev_mask.astype(bool)
+                curr = union_mask.astype(bool)
+                inter = np.logical_and(prev, curr).sum()
+                union = np.logical_or(prev, curr).sum()
+                if union > 0 and (inter / union) < 0.01 and state.miss_count < self.TEMPORAL_HOLD_FRAMES:
+                    union_mask = state.prev_mask.copy()
+                    used_hold = True
+                    state.miss_count += 1
+
+            if not used_hold:
+                if state.prev_box_xyxy is None:
+                    state.prev_box_xyxy = chosen_box.copy()
+                else:
+                    alpha = float(self.TEMPORAL_BOX_EMA)
+                    state.prev_box_xyxy = alpha * chosen_box + (1.0 - alpha) * state.prev_box_xyxy
+                state.prev_box_xyxy = self._clip_box_xyxy(state.prev_box_xyxy, img_h, img_w)
+                state.miss_count = 0
+            state.prev_mask = union_mask.copy()
+
+            masks[bi] = torch.from_numpy(union_mask.astype(np.float32)).to(device=images.device)
+
+        return masks
+
+
 class DiffusionPolicy(PreTrainedPolicy):
     """
     Diffusion Policy as per "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"
@@ -310,9 +841,17 @@ class DiffusionPolicy(PreTrainedPolicy):
             and self.config.enable_optical_flow_condition
             and len(self.config.image_features) > 0
         )
+        self._online_groundedsam2_mask_enabled = (
+            self._online_gmflow_enabled and self.config.enable_online_groundedsam2_mask_rollout
+        )
         self.online_gmflow_runner = None
+        self.online_groundedsam2_mask_runner = None
         self._gmflow_prev_images: dict[str, Tensor] = {}
         self._gmflow_flow_keys: dict[str, str] = {}
+        self._online_kalman_stateful_enabled = (
+            self.config.enable_online_kalman_rollout_stateful and self.config.enable_kalman_condition
+        )
+        self._online_kalman_states: list[_OnlineKalmanRuntimeState] = []
 
         if self._online_gmflow_enabled:
             policy_device = get_device_from_parameters(self.diffusion)
@@ -331,6 +870,8 @@ class DiffusionPolicy(PreTrainedPolicy):
                 feat: f"{PRECOMPUTED_FLOW_PREFIX}{PrecomputedOpticalFlowReader._camera_aliases(feat)[0]}"
                 for feat in self.config.image_features
             }
+            if self._online_groundedsam2_mask_enabled:
+                self.online_groundedsam2_mask_runner = OnlineGroundedSAM2MaskRunner(device=policy_device)
 
         self.reset()
 
@@ -351,6 +892,14 @@ class DiffusionPolicy(PreTrainedPolicy):
             for flow_key in self._gmflow_flow_keys.values():
                 self._queues[flow_key] = deque(maxlen=self.config.n_obs_steps)
             self._gmflow_prev_images = {}
+        if self._online_kalman_stateful_enabled:
+            self._queues[f"{PRECOMPUTED_KALMAN_PREFIX}pos"] = deque(maxlen=self.config.n_obs_steps)
+            self._queues[f"{PRECOMPUTED_KALMAN_PREFIX}vel"] = deque(maxlen=self.config.n_obs_steps)
+            self._queues[f"{PRECOMPUTED_KALMAN_PREFIX}pred_exec"] = deque(maxlen=self.config.n_obs_steps)
+            self._queues[f"{PRECOMPUTED_KALMAN_PREFIX}valid"] = deque(maxlen=self.config.n_obs_steps)
+            self._online_kalman_states = []
+        if self.online_groundedsam2_mask_runner is not None:
+            self.online_groundedsam2_mask_runner.reset()
 
     @torch.no_grad()
     def _attach_online_gmflow_to_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -380,6 +929,10 @@ class DiffusionPolicy(PreTrainedPolicy):
                 )
             else:
                 flow = self.online_gmflow_runner.infer(prev, curr).to(device=curr.device, dtype=curr.dtype)
+                if self.online_groundedsam2_mask_runner is not None:
+                    # Keep parity with local-flow precompute: only preserve task-relevant region for selected cameras.
+                    local_mask = self.online_groundedsam2_mask_runner.infer_mask(feat, curr)
+                    flow = flow * local_mask.unsqueeze(1).to(dtype=flow.dtype)
 
             out[self._gmflow_flow_keys[feat]] = flow
             # Cache the current frame for next-step flow estimation.
@@ -387,6 +940,153 @@ class DiffusionPolicy(PreTrainedPolicy):
                 device=self.online_gmflow_runner.device, dtype=torch.float32, non_blocking=True
             )
 
+        return out
+
+    def _ensure_online_kalman_states(self, batch_size: int) -> list[_OnlineKalmanRuntimeState]:
+        if len(self._online_kalman_states) != batch_size:
+            self._online_kalman_states = [_OnlineKalmanRuntimeState() for _ in range(batch_size)]
+        return self._online_kalman_states
+
+    def _attach_online_kalman_to_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Attach rollout-time Kalman features with persistent state across environment steps."""
+        if not self._online_kalman_stateful_enabled:
+            return batch
+        if OBS_STATE not in batch:
+            return batch
+
+        out = dict(batch)
+        state_obs = out[OBS_STATE]
+        if state_obs.ndim == 1:
+            state_obs = state_obs.unsqueeze(0)
+            out[OBS_STATE] = state_obs
+        if state_obs.ndim != 2:
+            raise ValueError(
+                f"Expected observation.state to be rank-2 (B,D) during rollout, got {tuple(state_obs.shape)}"
+            )
+
+        # Prefer explicitly provided raw (unnormalized) state when available.
+        kalman_state_obs = out.get(OBS_STATE_RAW, state_obs)
+        if kalman_state_obs.ndim == 1:
+            kalman_state_obs = kalman_state_obs.unsqueeze(0)
+            out[OBS_STATE_RAW] = kalman_state_obs
+        if kalman_state_obs.ndim != 2:
+            raise ValueError(
+                "Expected observation.state.raw to be rank-2 (B,D) during rollout, "
+                f"got {tuple(kalman_state_obs.shape)}"
+            )
+        if kalman_state_obs.shape[0] != state_obs.shape[0]:
+            raise ValueError(
+                "Mismatched batch size between observation.state and observation.state.raw: "
+                f"{state_obs.shape[0]} vs {kalman_state_obs.shape[0]}"
+            )
+
+        z = kalman_state_obs[..., self.diffusion._kalman_pos_slice]
+        if z.shape[-1] != 3:
+            raise ValueError(
+                f"Kalman state position slice {self.config.kalman_state_pos_slice} produced shape {tuple(z.shape)}."
+            )
+        b = z.shape[0]
+        states = self._ensure_online_kalman_states(b)
+
+        ts_list: list[float | None] | None = None
+        if "timestamp" in out:
+            ts = out["timestamp"]
+            if ts.ndim == 0:
+                ts = ts.unsqueeze(0)
+            if ts.ndim >= 2:
+                ts = ts.reshape(ts.shape[0], -1)[:, 0]
+            ts_list = ts.detach().to(device="cpu", dtype=torch.float64).tolist()
+
+        device = kalman_state_obs.device
+        dtype = kalman_state_obs.dtype
+        pos = torch.zeros((b, 3), device=device, dtype=dtype)
+        vel = torch.zeros((b, 3), device=device, dtype=dtype)
+        pred_exec = torch.zeros((b, 3), device=device, dtype=dtype)
+        valid = torch.ones((b,), device=device, dtype=dtype)
+
+        p_pos = float(self.config.kalman_init_pos_std**2)
+        p_vel = float(self.config.kalman_init_vel_std**2)
+        r = torch.eye(3, device=device, dtype=dtype) * float(self.config.kalman_meas_noise_std**2)
+        h = torch.zeros((3, 6), device=device, dtype=dtype)
+        h[:, :3] = torch.eye(3, device=device, dtype=dtype)
+        i6 = torch.eye(6, device=device, dtype=dtype)
+
+        def _make_f_q(dt_value: float) -> tuple[Tensor, Tensor]:
+            dt = torch.tensor(float(dt_value), device=device, dtype=dtype)
+            dt2 = dt.square()
+            dt3 = dt2 * dt
+            dt4 = dt2.square()
+            f = torch.eye(6, device=device, dtype=dtype)
+            f[:3, 3:] = torch.eye(3, device=device, dtype=dtype) * dt
+            sigma2 = float(self.config.kalman_accel_noise_std**2)
+            q = torch.zeros((6, 6), device=device, dtype=dtype)
+            q_pos = (dt4 / 4.0) * sigma2
+            q_cross = (dt3 / 2.0) * sigma2
+            q_vel = dt2 * sigma2
+            for axis in range(3):
+                q[axis, axis] = q_pos
+                q[axis, axis + 3] = q_cross
+                q[axis + 3, axis] = q_cross
+                q[axis + 3, axis + 3] = q_vel
+            return f, q
+
+        for bi in range(b):
+            runtime = states[bi]
+            meas = z[bi]
+            meas_valid = bool(torch.isfinite(meas).all())
+            if runtime.x is None or runtime.p is None:
+                x = torch.zeros((6,), device=device, dtype=dtype)
+                if meas_valid:
+                    x[:3] = torch.nan_to_num(meas, nan=0.0, posinf=0.0, neginf=0.0)
+                p = torch.zeros((6, 6), device=device, dtype=dtype)
+                for axis in range(3):
+                    p[axis, axis] = p_pos
+                    p[axis + 3, axis + 3] = p_vel
+            else:
+                x = runtime.x.to(device=device, dtype=dtype)
+                p = runtime.p.to(device=device, dtype=dtype)
+
+            # After the first step, always run predict. Use timestamps when available, otherwise fallback dt.
+            if runtime.step_count > 0:
+                dt = float(self.config.kalman_dt_fallback)
+                if ts_list is not None and bi < len(ts_list):
+                    ts_val = ts_list[bi]
+                    if ts_val is not None and np.isfinite(ts_val) and runtime.prev_timestamp is not None:
+                        dt_measured = float(ts_val - runtime.prev_timestamp)
+                        # Keep parity with sidecar precompute script: clamp invalid/huge dt to fallback.
+                        if np.isfinite(dt_measured) and 0.0 < dt_measured <= 1.0:
+                            dt = dt_measured
+                f, q = _make_f_q(dt)
+                x = f @ x
+                p = f @ p @ f.transpose(0, 1) + q
+
+            if meas_valid:
+                y = torch.nan_to_num(meas, nan=0.0, posinf=0.0, neginf=0.0) - (h @ x)
+                s_mat = h @ p @ h.transpose(0, 1) + r
+                k_gain = p @ h.transpose(0, 1) @ torch.linalg.inv(s_mat)
+                x = x + (k_gain @ y)
+                p = (i6 - (k_gain @ h)) @ p
+                valid[bi] = 1.0
+            else:
+                valid[bi] = 0.0
+
+            f_exec, _ = _make_f_q(float(self.config.kalman_predict_horizon))
+            x_exec = f_exec @ x
+            pos[bi] = x[:3]
+            vel[bi] = x[3:]
+            pred_exec[bi] = x_exec[:3]
+
+            runtime.x = x.detach()
+            runtime.p = p.detach()
+            runtime.step_count += 1
+            if ts_list is not None and bi < len(ts_list):
+                ts_val = ts_list[bi]
+                runtime.prev_timestamp = float(ts_val) if ts_val is not None and np.isfinite(ts_val) else None
+
+        out[f"{PRECOMPUTED_KALMAN_PREFIX}pos"] = pos
+        out[f"{PRECOMPUTED_KALMAN_PREFIX}vel"] = vel
+        out[f"{PRECOMPUTED_KALMAN_PREFIX}pred_exec"] = pred_exec
+        out[f"{PRECOMPUTED_KALMAN_PREFIX}valid"] = valid
         return out
 
     @torch.no_grad()
@@ -427,6 +1127,9 @@ class DiffusionPolicy(PreTrainedPolicy):
         if self._online_gmflow_enabled:
             # Rollout-only path: compute GMFlow from consecutive observations and inject as precomputed flow.
             batch = self._attach_online_gmflow_to_batch(batch)
+        if self._online_kalman_stateful_enabled:
+            # Rollout-only path: keep a persistent Kalman state and inject precomputed_kalman_* keys.
+            batch = self._attach_online_kalman_to_batch(batch)
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -471,6 +1174,7 @@ class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
+        self._kalman_pos_slice = self._parse_kalman_pos_slice(self.config.kalman_state_pos_slice)
 
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = self.config.robot_state_feature.shape[0]
@@ -521,6 +1225,38 @@ class DiffusionModel(nn.Module):
             self._warned_precomputed_flow_fallback = False
             self.register_buffer("flow_kernel_x", None, persistent=False)
             self.register_buffer("flow_kernel_y", None, persistent=False)
+
+        if self.config.enable_kalman_condition:
+            self.kalman_raw_dim = 10 if self.config.kalman_feature_mode == "full10" else 6
+            self.kalman_feature_norm = nn.LayerNorm(self.kalman_raw_dim)
+            self.kalman_projector = nn.Sequential(
+                nn.Linear(self.kalman_raw_dim, self.config.kalman_feature_dim),
+                nn.SiLU(),
+                nn.Linear(self.config.kalman_feature_dim, self.config.kalman_feature_dim),
+            )
+            kalman_mean, kalman_std = self._load_kalman_stats_or_default()
+            self.register_buffer("kalman_stats_mean", kalman_mean, persistent=False)
+            self.register_buffer("kalman_stats_std", kalman_std, persistent=False)
+            global_cond_dim += self.config.kalman_feature_dim
+            if self.config.precomputed_kalman_root:
+                self.precomputed_kalman_reader = PrecomputedKalmanReader(
+                    root=self.config.precomputed_kalman_root,
+                    n_obs_steps=self.config.n_obs_steps,
+                    observation_delta_indices=self.config.observation_delta_indices,
+                    cache_size=self.config.precomputed_kalman_cache_size,
+                    feature_mode=self.config.kalman_feature_mode,
+                )
+            else:
+                self.precomputed_kalman_reader = None
+            self._warned_precomputed_kalman_fallback = False
+        else:
+            self.kalman_raw_dim = 0
+            self.kalman_feature_norm = None
+            self.kalman_projector = None
+            self.register_buffer("kalman_stats_mean", None, persistent=False)
+            self.register_buffer("kalman_stats_std", None, persistent=False)
+            self.precomputed_kalman_reader = None
+            self._warned_precomputed_kalman_fallback = False
 
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
@@ -585,6 +1321,52 @@ class DiffusionModel(nn.Module):
 
         return sample
 
+    @staticmethod
+    def _parse_kalman_pos_slice(spec: str) -> slice:
+        parts = spec.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid kalman position slice: {spec}")
+        start = int(parts[0]) if parts[0] else None
+        end = int(parts[1]) if parts[1] else None
+        return slice(start, end)
+
+    def _load_kalman_stats_or_default(self) -> tuple[Tensor, Tensor]:
+        mean = torch.zeros((self.kalman_raw_dim,), dtype=torch.float32)
+        std = torch.ones((self.kalman_raw_dim,), dtype=torch.float32)
+        if not self.config.kalman_use_dataset_stats_norm:
+            return mean, std
+
+        candidates: list[Path] = []
+        if self.config.kalman_stats_path:
+            candidates.append(Path(self.config.kalman_stats_path))
+        if self.config.precomputed_kalman_root:
+            candidates.append(Path(self.config.precomputed_kalman_root) / "normalization.json")
+
+        for path in candidates:
+            if not path.exists():
+                continue
+            with path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if "mean" not in payload or "std" not in payload:
+                raise ValueError(f"Invalid kalman stats file (missing mean/std): {path}")
+            mean_np = np.asarray(payload["mean"], dtype=np.float32)
+            std_np = np.asarray(payload["std"], dtype=np.float32)
+            if mean_np.shape != (self.kalman_raw_dim,) or std_np.shape != (self.kalman_raw_dim,):
+                raise ValueError(
+                    f"Kalman stats must be shape ({self.kalman_raw_dim},). "
+                    f"Got mean={mean_np.shape}, std={std_np.shape} from {path}"
+                )
+            std_np = np.maximum(std_np, self.config.kalman_norm_eps).astype(np.float32)
+            logging.info(f"Loaded Kalman normalization stats from {path}")
+            return torch.from_numpy(mean_np), torch.from_numpy(std_np)
+
+        logging.warning(
+            "Kalman dataset-stats normalization is enabled but no stats file was found. "
+            "Using identity normalization. Set `policy.kalman_stats_path` or place "
+            "`normalization.json` under `precomputed_kalman_root`."
+        )
+        return mean, std
+
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
@@ -642,11 +1424,44 @@ class DiffusionModel(nn.Module):
                     flow_features = flow_features * keep_mask / keep_prob
                 global_cond_feats.append(flow_features)
 
+        if self.config.enable_kalman_condition and self.kalman_projector is not None:
+            kalman_raw = self._get_kalman_features(batch)
+            if self.config.kalman_use_dataset_stats_norm:
+                kalman_raw = (kalman_raw - self.kalman_stats_mean.to(kalman_raw)) / self.kalman_stats_std.to(
+                    kalman_raw
+                )
+            kalman_raw = self.kalman_feature_norm(kalman_raw)
+            kalman_features = self.kalman_projector(kalman_raw)
+            global_cond_feats.append(kalman_features)
+
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+
+    def _get_kalman_features(self, batch: dict[str, Tensor]) -> Tensor:
+        state_obs = batch[OBS_STATE]
+        from_batch = self._get_precomputed_kalman_features_from_batch(batch, ref_state=state_obs)
+        if from_batch is not None:
+            return from_batch
+
+        if self.precomputed_kalman_reader is not None:
+            try:
+                return self.precomputed_kalman_reader.get_kalman_features(batch, ref_state=state_obs)
+            except KeyError:
+                if not self._warned_precomputed_kalman_fallback:
+                    logging.warning(
+                        "Precomputed Kalman root is set but batch lacks dataset index metadata. "
+                        "Falling back to online Kalman computation from observation.state for this run."
+                    )
+                    self._warned_precomputed_kalman_fallback = True
+            except FileNotFoundError:
+                raise
+            except Exception:
+                raise
+
+        return self._compute_online_kalman_from_state(batch)
 
     def _get_optical_flow_maps(self, batch: dict[str, Tensor]) -> Tensor:
         """Get optical flow from precomputed cache when configured, otherwise compute online."""
@@ -702,6 +1517,159 @@ class DiffusionModel(nn.Module):
                     f"got={tuple(flow.shape)}, expected=(B={b}, S={s}, 2, H, W)"
                 )
             out[:, :, ni] = flow.to(device=ref_images.device, dtype=ref_images.dtype)
+
+        return out
+
+    def _get_precomputed_kalman_features_from_batch(
+        self, batch: dict[str, Tensor], ref_state: Tensor
+    ) -> Tensor | None:
+        required = [f"{PRECOMPUTED_KALMAN_PREFIX}pos", f"{PRECOMPUTED_KALMAN_PREFIX}vel"]
+        if self.config.kalman_feature_mode == "full10":
+            required.append(f"{PRECOMPUTED_KALMAN_PREFIX}pred_exec")
+        if any(key not in batch for key in required):
+            return None
+
+        b, s = ref_state.shape[:2]
+
+        def _ensure_bsd(x: Tensor, d_expected: int) -> Tensor:
+            if x.ndim == 2:
+                x = x.unsqueeze(1)
+            if x.ndim != 3:
+                raise ValueError(f"Unexpected Kalman tensor rank: got={tuple(x.shape)}, expected 2D or 3D")
+            if x.shape[0] != b:
+                raise ValueError(f"Unexpected Kalman batch size: got={x.shape[0]}, expected={b}")
+            if x.shape[1] != s:
+                raise ValueError(f"Unexpected Kalman sequence length: got={x.shape[1]}, expected={s}")
+            if x.shape[2] != d_expected:
+                raise ValueError(f"Unexpected Kalman feature dim: got={x.shape[2]}, expected={d_expected}")
+            return x.to(device=ref_state.device, dtype=ref_state.dtype)
+
+        pos = _ensure_bsd(batch[f"{PRECOMPUTED_KALMAN_PREFIX}pos"], 3)
+        vel = _ensure_bsd(batch[f"{PRECOMPUTED_KALMAN_PREFIX}vel"], 3)
+        if self.config.kalman_feature_mode != "full10":
+            return torch.cat([pos, vel], dim=-1)
+        pred = _ensure_bsd(batch[f"{PRECOMPUTED_KALMAN_PREFIX}pred_exec"], 3)
+
+        valid_key = f"{PRECOMPUTED_KALMAN_PREFIX}valid"
+        if valid_key in batch:
+            valid = batch[valid_key]
+            if valid.ndim == 1:
+                valid = valid.unsqueeze(1)
+            if valid.ndim != 2:
+                raise ValueError(f"Unexpected Kalman valid tensor rank: got={tuple(valid.shape)}, expected 1D or 2D")
+            if valid.shape[0] != b or valid.shape[1] != s:
+                raise ValueError(
+                    f"Unexpected Kalman valid shape: got={tuple(valid.shape)}, expected=(B={b}, S={s})"
+                )
+            valid = valid.to(device=ref_state.device, dtype=ref_state.dtype).unsqueeze(-1)
+        else:
+            valid = torch.ones((b, s, 1), device=ref_state.device, dtype=ref_state.dtype)
+
+        return torch.cat([pos, vel, pred, valid], dim=-1)
+
+    def _compute_online_kalman_from_state(self, batch: dict[str, Tensor]) -> Tensor:
+        """
+        Compute Kalman features from observation.state on the fly.
+        Returns (B, S, D):
+          - full10: [pos(3), vel(3), pred_exec(3), valid(1)]
+          - posvel6: [pos(3), vel(3)]
+        """
+        state_obs = batch[OBS_STATE]
+        b, s, d = state_obs.shape
+        z = state_obs[..., self._kalman_pos_slice]
+        if z.shape[-1] != 3:
+            raise ValueError(
+                f"Kalman state position slice {self.config.kalman_state_pos_slice} produced shape {tuple(z.shape)} "
+                f"from observation.state shape {tuple(state_obs.shape)}."
+            )
+        device = state_obs.device
+        dtype = state_obs.dtype
+
+        valid = torch.isfinite(z).all(dim=-1)
+        z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+
+        dt = torch.full((b, s), float(self.config.kalman_dt_fallback), device=device, dtype=dtype)
+        if "timestamp" in batch:
+            ts = batch["timestamp"]
+            if ts.ndim == 1:
+                ts = ts.unsqueeze(1)
+            if ts.ndim >= 2 and ts.shape[0] == b and ts.shape[1] == s:
+                dt[:, 1:] = (ts[:, 1:] - ts[:, :-1]).to(dtype=dtype)
+                dt = torch.where(
+                    (dt > 0) & torch.isfinite(dt),
+                    dt,
+                    torch.full_like(dt, float(self.config.kalman_dt_fallback)),
+                )
+
+        def _make_f_q(step_dt: Tensor) -> tuple[Tensor, Tensor]:
+            step_dt = step_dt.to(dtype=dtype)
+            dt2 = step_dt.square()
+            dt3 = dt2 * step_dt
+            dt4 = dt2.square()
+
+            f = torch.eye(6, device=device, dtype=dtype).unsqueeze(0).repeat(b, 1, 1)
+            f[:, :3, 3:] = torch.eye(3, device=device, dtype=dtype).unsqueeze(0) * step_dt.view(b, 1, 1)
+
+            sigma2 = float(self.config.kalman_accel_noise_std**2)
+            q = torch.zeros((b, 6, 6), device=device, dtype=dtype)
+            q_pos = (dt4 / 4.0) * sigma2
+            q_cross = (dt3 / 2.0) * sigma2
+            q_vel = dt2 * sigma2
+            for axis in range(3):
+                q[:, axis, axis] = q_pos
+                q[:, axis, axis + 3] = q_cross
+                q[:, axis + 3, axis] = q_cross
+                q[:, axis + 3, axis + 3] = q_vel
+            return f, q
+
+        x = torch.zeros((b, 6), device=device, dtype=dtype)
+        x[:, :3] = z[:, 0]
+        p = torch.zeros((b, 6, 6), device=device, dtype=dtype)
+        p_pos = float(self.config.kalman_init_pos_std**2)
+        p_vel = float(self.config.kalman_init_vel_std**2)
+        for axis in range(3):
+            p[:, axis, axis] = p_pos
+            p[:, axis + 3, axis + 3] = p_vel
+
+        h = torch.zeros((1, 3, 6), device=device, dtype=dtype).repeat(b, 1, 1)
+        h[:, :, :3] = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+        r = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(b, 1, 1) * float(
+            self.config.kalman_meas_noise_std**2
+        )
+        i6 = torch.eye(6, device=device, dtype=dtype).unsqueeze(0).repeat(b, 1, 1)
+
+        if self.config.kalman_feature_mode == "full10":
+            out = torch.zeros((b, s, 10), device=device, dtype=dtype)
+        else:
+            out = torch.zeros((b, s, 6), device=device, dtype=dtype)
+
+        for si in range(s):
+            if si > 0:
+                f, q = _make_f_q(dt[:, si])
+                x = torch.bmm(f, x.unsqueeze(-1)).squeeze(-1)
+                p = torch.bmm(torch.bmm(f, p), f.transpose(1, 2)) + q
+
+            z_si = z[:, si]
+            valid_si = valid[:, si]
+            if bool(valid_si.any()):
+                y = z_si - torch.bmm(h, x.unsqueeze(-1)).squeeze(-1)
+                s_mat = torch.bmm(torch.bmm(h, p), h.transpose(1, 2)) + r
+                k_gain = torch.bmm(torch.bmm(p, h.transpose(1, 2)), torch.linalg.inv(s_mat))
+                x_upd = x + torch.bmm(k_gain, y.unsqueeze(-1)).squeeze(-1)
+                p_upd = torch.bmm(i6 - torch.bmm(k_gain, h), p)
+                mask = valid_si.unsqueeze(-1)
+                x = torch.where(mask, x_upd, x)
+                p = torch.where(mask.unsqueeze(-1), p_upd, p)
+
+            out[:, si, :3] = x[:, :3]
+            out[:, si, 3:6] = x[:, 3:]
+            if self.config.kalman_feature_mode == "full10":
+                f_exec, _ = _make_f_q(
+                    torch.full((b,), float(self.config.kalman_predict_horizon), device=device, dtype=dtype)
+                )
+                x_exec = torch.bmm(f_exec, x.unsqueeze(-1)).squeeze(-1)
+                out[:, si, 6:9] = x_exec[:, :3]
+                out[:, si, 9] = valid_si.to(dtype=dtype)
 
         return out
 

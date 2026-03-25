@@ -1112,21 +1112,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
             return arrays
 
         ep_dir = self.precomputed_optical_flow_root / f"episode_{episode_index:06d}"
-        npz_path = ep_dir / "flows.npz"
-        arrays: dict[str, np.ndarray]
-        if npz_path.exists():
-            with np.load(npz_path, allow_pickle=False) as data:
-                arrays = {k: np.asarray(data[k]) for k in data.files}
-        else:
-            index_path = ep_dir / "arrays.json"
-            if not index_path.exists():
-                raise FileNotFoundError(f"Missing precomputed flow file: {npz_path} or {index_path}")
-            with index_path.open("r", encoding="utf-8") as f:
-                metadata = json.load(f)
-            arrays = {
-                key: np.load(ep_dir / f"{key}.npy", mmap_mode="r", allow_pickle=False)
-                for key in metadata.keys()
-            }
+        index_path = ep_dir / "arrays.json"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Missing precomputed flow metadata file: {index_path}")
+        with index_path.open("r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        arrays = {
+            key: np.load(ep_dir / f"{key}.npy", mmap_mode="r", allow_pickle=False)
+            for key in metadata.keys()
+        }
         self._precomputed_flow_cache[episode_index] = arrays
 
         while len(self._precomputed_flow_cache) > self.precomputed_optical_flow_cache_size:
