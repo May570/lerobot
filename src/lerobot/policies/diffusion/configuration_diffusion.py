@@ -114,6 +114,10 @@ class DiffusionConfig(PreTrainedConfig):
             feature normalization, where D is 10 for "full10" and 6 for "posvel6".
             If unset, code will try <precomputed_kalman_root>/normalization.json.
         kalman_norm_eps: Numerical stability epsilon used when dividing by std.
+        enable_kalman_posvel6_direct_condition: Independent Kalman conditioning branch that always runs
+            online from processed `observation.state` (post-preprocessor). It outputs a 6D tensor
+            [pos_input(3), kalman_vel(3)] per observation step and concatenates it directly into
+            global conditioning (no LayerNorm/MLP projection).
         enable_online_gmflow_rollout: Whether to run GMFlow online during rollout (`select_action`) and
             inject the result as `precomputed_flow_*` tensors for conditioning. When disabled, rollout
             behavior is unchanged and falls back to hand-crafted online flow if needed.
@@ -211,6 +215,8 @@ class DiffusionConfig(PreTrainedConfig):
     kalman_use_dataset_stats_norm: bool = True
     kalman_stats_path: str | None = None
     kalman_norm_eps: float = 1e-6
+    # Independent branch: online Kalman velocity + direct 6D [pos, vel] concat.
+    enable_kalman_posvel6_direct_condition: bool = False
     # Rollout-only: keep a persistent online Kalman filter state across env steps.
     # When enabled, select_action injects precomputed_kalman_* keys from streaming state observations,
     # which better matches long-horizon precompute than recomputing from short n_obs_steps windows.

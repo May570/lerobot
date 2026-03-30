@@ -1258,6 +1258,10 @@ class DiffusionModel(nn.Module):
             self.precomputed_kalman_reader = None
             self._warned_precomputed_kalman_fallback = False
 
+        if self.config.enable_kalman_posvel6_direct_condition:
+            # Direct concat branch: append online [pos(3), vel(3)] without LayerNorm/MLP projection.
+            global_cond_dim += 6
+
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
@@ -1433,6 +1437,10 @@ class DiffusionModel(nn.Module):
             kalman_raw = self.kalman_feature_norm(kalman_raw)
             kalman_features = self.kalman_projector(kalman_raw)
             global_cond_feats.append(kalman_features)
+
+        if self.config.enable_kalman_posvel6_direct_condition:
+            kalman_direct_posvel = self._compute_online_kalman_posvel6_direct_from_processed_state(batch)
+            global_cond_feats.append(kalman_direct_posvel)
 
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
@@ -1674,6 +1682,103 @@ class DiffusionModel(nn.Module):
                 x_exec = torch.bmm(f_exec, x.unsqueeze(-1)).squeeze(-1)
                 out[:, si, 6:9] = x_exec[:, :3]
                 out[:, si, 9] = valid_si.to(dtype=dtype)
+
+        return out
+
+    def _compute_online_kalman_posvel6_direct_from_processed_state(self, batch: dict[str, Tensor]) -> Tensor:
+        """
+        Compute a direct-concat Kalman feature from processed observation.state.
+
+        Output is always (B, S, 6): [input_pos(3), kalman_vel(3)].
+        Pos is the (processed) input measurement directly, while vel is estimated by a
+        constant-velocity Kalman filter updated online from the same processed state.
+        """
+        state_obs = batch[OBS_STATE]
+        b, s, _ = state_obs.shape
+        z = state_obs[..., self._kalman_pos_slice]
+        if z.shape[-1] != 3:
+            raise ValueError(
+                f"Kalman state position slice {self.config.kalman_state_pos_slice} produced shape {tuple(z.shape)} "
+                f"from observation.state shape {tuple(state_obs.shape)}."
+            )
+        device = state_obs.device
+        dtype = state_obs.dtype
+
+        valid = torch.isfinite(z).all(dim=-1)
+        z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+
+        dt = torch.full((b, s), float(self.config.kalman_dt_fallback), device=device, dtype=dtype)
+        if "timestamp" in batch:
+            ts = batch["timestamp"]
+            if ts.ndim == 1:
+                ts = ts.unsqueeze(1)
+            if ts.ndim >= 2 and ts.shape[0] == b and ts.shape[1] == s:
+                dt[:, 1:] = (ts[:, 1:] - ts[:, :-1]).to(dtype=dtype)
+                dt = torch.where(
+                    (dt > 0) & torch.isfinite(dt),
+                    dt,
+                    torch.full_like(dt, float(self.config.kalman_dt_fallback)),
+                )
+
+        def _make_f_q(step_dt: Tensor) -> tuple[Tensor, Tensor]:
+            step_dt = step_dt.to(dtype=dtype)
+            dt2 = step_dt.square()
+            dt3 = dt2 * step_dt
+            dt4 = dt2.square()
+
+            f = torch.eye(6, device=device, dtype=dtype).unsqueeze(0).repeat(b, 1, 1)
+            f[:, :3, 3:] = torch.eye(3, device=device, dtype=dtype).unsqueeze(0) * step_dt.view(b, 1, 1)
+
+            sigma2 = float(self.config.kalman_accel_noise_std**2)
+            q = torch.zeros((b, 6, 6), device=device, dtype=dtype)
+            q_pos = (dt4 / 4.0) * sigma2
+            q_cross = (dt3 / 2.0) * sigma2
+            q_vel = dt2 * sigma2
+            for axis in range(3):
+                q[:, axis, axis] = q_pos
+                q[:, axis, axis + 3] = q_cross
+                q[:, axis + 3, axis] = q_cross
+                q[:, axis + 3, axis + 3] = q_vel
+            return f, q
+
+        x = torch.zeros((b, 6), device=device, dtype=dtype)
+        x[:, :3] = z[:, 0]
+        p = torch.zeros((b, 6, 6), device=device, dtype=dtype)
+        p_pos = float(self.config.kalman_init_pos_std**2)
+        p_vel = float(self.config.kalman_init_vel_std**2)
+        for axis in range(3):
+            p[:, axis, axis] = p_pos
+            p[:, axis + 3, axis + 3] = p_vel
+
+        h = torch.zeros((1, 3, 6), device=device, dtype=dtype).repeat(b, 1, 1)
+        h[:, :, :3] = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+        r = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(b, 1, 1) * float(
+            self.config.kalman_meas_noise_std**2
+        )
+        i6 = torch.eye(6, device=device, dtype=dtype).unsqueeze(0).repeat(b, 1, 1)
+
+        out = torch.zeros((b, s, 6), device=device, dtype=dtype)
+        for si in range(s):
+            if si > 0:
+                f, q = _make_f_q(dt[:, si])
+                x = torch.bmm(f, x.unsqueeze(-1)).squeeze(-1)
+                p = torch.bmm(torch.bmm(f, p), f.transpose(1, 2)) + q
+
+            z_si = z[:, si]
+            valid_si = valid[:, si]
+            if bool(valid_si.any()):
+                y = z_si - torch.bmm(h, x.unsqueeze(-1)).squeeze(-1)
+                s_mat = torch.bmm(torch.bmm(h, p), h.transpose(1, 2)) + r
+                k_gain = torch.bmm(torch.bmm(p, h.transpose(1, 2)), torch.linalg.inv(s_mat))
+                x_upd = x + torch.bmm(k_gain, y.unsqueeze(-1)).squeeze(-1)
+                p_upd = torch.bmm(i6 - torch.bmm(k_gain, h), p)
+                mask = valid_si.unsqueeze(-1)
+                x = torch.where(mask, x_upd, x)
+                p = torch.where(mask.unsqueeze(-1), p_upd, p)
+
+            # Per design: direct passthrough position + Kalman-estimated velocity.
+            out[:, si, :3] = z_si
+            out[:, si, 3:6] = x[:, 3:]
 
         return out
 
