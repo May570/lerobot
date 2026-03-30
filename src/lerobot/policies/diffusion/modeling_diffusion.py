@@ -1442,6 +1442,10 @@ class DiffusionModel(nn.Module):
 
     def _get_kalman_features(self, batch: dict[str, Tensor]) -> Tensor:
         state_obs = batch[OBS_STATE]
+        if self.config.kalman_force_zero_input:
+            b, s = state_obs.shape[:2]
+            return torch.zeros((b, s, self.kalman_raw_dim), device=state_obs.device, dtype=state_obs.dtype)
+
         from_batch = self._get_precomputed_kalman_features_from_batch(batch, ref_state=state_obs)
         if from_batch is not None:
             return from_batch

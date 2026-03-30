@@ -97,6 +97,9 @@ class DiffusionConfig(PreTrainedConfig):
         kalman_feature_mode: Raw Kalman feature layout before projection.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
             - "posvel6": [pos(3), vel(3)]
+        kalman_force_zero_input: If True, bypass all Kalman data sources and always feed an all-zero
+            raw Kalman tensor into the Kalman branch. This keeps the branch architecture enabled while
+            removing any Kalman signal from disk or online computation.
         kalman_state_pos_slice: Slice in observation.state used as xyz measurement for online Kalman
             computation, in "start:end" format.
         kalman_predict_horizon: Seconds to predict forward when building the execution-time position feature.
@@ -197,6 +200,7 @@ class DiffusionConfig(PreTrainedConfig):
     precomputed_kalman_cache_size: int = 8
     kalman_feature_dim: int = 32
     kalman_feature_mode: str = "full10"
+    kalman_force_zero_input: bool = False
     kalman_state_pos_slice: str = "0:3"
     kalman_predict_horizon: float = 0.1
     kalman_dt_fallback: float = 0.1
