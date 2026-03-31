@@ -28,6 +28,7 @@ def _make_config(
     enable_kalman_condition: bool = True,
     enable_kalman_posvel6_direct_condition: bool = False,
     kalman_force_zero_input: bool = True,
+    kalman_force_zero_global_condition: bool = False,
 ) -> DiffusionConfig:
     return DiffusionConfig(
         input_features={
@@ -40,6 +41,7 @@ def _make_config(
         enable_kalman_posvel6_direct_condition=enable_kalman_posvel6_direct_condition,
         kalman_feature_mode=kalman_feature_mode,
         kalman_force_zero_input=kalman_force_zero_input,
+        kalman_force_zero_global_condition=kalman_force_zero_global_condition,
         precomputed_kalman_root=None,
         kalman_use_dataset_stats_norm=False,
         down_dims=(64, 128),
@@ -109,3 +111,63 @@ def test_kalman_posvel6_direct_condition_is_online_from_processed_state():
     global_cond = model._prepare_global_conditioning(batch)
     global_cond_steps = global_cond.view(state.shape[0], cfg.n_obs_steps, -1)
     assert torch.allclose(global_cond_steps[..., -6:], direct, atol=1e-6)
+
+
+def test_kalman_force_zero_global_condition_zeros_projected_branch(monkeypatch):
+    cfg = _make_config(
+        enable_kalman_condition=True,
+        enable_kalman_posvel6_direct_condition=False,
+        kalman_force_zero_input=False,
+        kalman_force_zero_global_condition=True,
+    )
+    policy = DiffusionPolicy(cfg)
+    model = policy.diffusion
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("Expected kalman_force_zero_global_condition to bypass projected Kalman computation")
+
+    monkeypatch.setattr(model, "_get_kalman_features", _fail)
+
+    state = torch.randn(2, cfg.n_obs_steps, 8)
+    batch = {
+        OBS_STATE: state,
+        OBS_IMAGES: torch.zeros((state.shape[0], cfg.n_obs_steps, 1, 3, 32, 32), dtype=torch.float32),
+    }
+    global_cond = model._prepare_global_conditioning(batch)
+    global_cond_steps = global_cond.view(state.shape[0], cfg.n_obs_steps, -1)
+
+    assert torch.allclose(global_cond_steps[..., :8], state, atol=1e-6)
+    assert torch.count_nonzero(global_cond_steps[..., -cfg.kalman_feature_dim :]).item() == 0
+
+
+def test_kalman_force_zero_global_condition_zeros_direct_branch(monkeypatch):
+    cfg = _make_config(
+        enable_kalman_condition=False,
+        enable_kalman_posvel6_direct_condition=True,
+        kalman_force_zero_input=False,
+        kalman_force_zero_global_condition=True,
+    )
+    policy = DiffusionPolicy(cfg)
+    model = policy.diffusion
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("Expected kalman_force_zero_global_condition to bypass direct Kalman computation")
+
+    monkeypatch.setattr(model, "_compute_online_kalman_posvel6_direct_from_processed_state", _fail)
+
+    state = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0, 9.0, 9.0, 9.0, 9.0, 9.0], [1.0, 0.0, 0.0, 9.0, 9.0, 9.0, 9.0, 9.0]],
+            [[2.0, 1.0, 0.5, 7.0, 7.0, 7.0, 7.0, 7.0], [2.0, 1.0, 0.5, 7.0, 7.0, 7.0, 7.0, 7.0]],
+        ],
+        dtype=torch.float32,
+    )
+    batch = {
+        OBS_STATE: state,
+        OBS_IMAGES: torch.zeros((state.shape[0], cfg.n_obs_steps, 1, 3, 32, 32), dtype=torch.float32),
+    }
+    global_cond = model._prepare_global_conditioning(batch)
+    global_cond_steps = global_cond.view(state.shape[0], cfg.n_obs_steps, -1)
+
+    assert torch.allclose(global_cond_steps[..., :8], state, atol=1e-6)
+    assert torch.count_nonzero(global_cond_steps[..., -6:]).item() == 0

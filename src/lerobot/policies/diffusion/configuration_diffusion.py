@@ -100,6 +100,10 @@ class DiffusionConfig(PreTrainedConfig):
         kalman_force_zero_input: If True, bypass all Kalman data sources and always feed an all-zero
             raw Kalman tensor into the Kalman branch. This keeps the branch architecture enabled while
             removing any Kalman signal from disk or online computation.
+        kalman_force_zero_global_condition: If True, force the Kalman-derived tensor appended to
+            global conditioning to be exactly zero. This is stricter than `kalman_force_zero_input`
+            because it guarantees zero after the MLP-projected Kalman branch as well, and it also
+            applies to the direct 6D Kalman concat branch when enabled.
         kalman_state_pos_slice: Slice in observation.state used as xyz measurement for online Kalman
             computation, in "start:end" format.
         kalman_predict_horizon: Seconds to predict forward when building the execution-time position feature.
@@ -205,6 +209,7 @@ class DiffusionConfig(PreTrainedConfig):
     kalman_feature_dim: int = 32
     kalman_feature_mode: str = "full10"
     kalman_force_zero_input: bool = False
+    kalman_force_zero_global_condition: bool = False
     kalman_state_pos_slice: str = "0:3"
     kalman_predict_horizon: float = 0.1
     kalman_dt_fallback: float = 0.1

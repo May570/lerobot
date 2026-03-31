@@ -1429,17 +1429,31 @@ class DiffusionModel(nn.Module):
                 global_cond_feats.append(flow_features)
 
         if self.config.enable_kalman_condition and self.kalman_projector is not None:
-            kalman_raw = self._get_kalman_features(batch)
-            if self.config.kalman_use_dataset_stats_norm:
-                kalman_raw = (kalman_raw - self.kalman_stats_mean.to(kalman_raw)) / self.kalman_stats_std.to(
-                    kalman_raw
+            if self.config.kalman_force_zero_global_condition:
+                kalman_features = torch.zeros(
+                    (batch_size, n_obs_steps, self.config.kalman_feature_dim),
+                    device=batch[OBS_STATE].device,
+                    dtype=batch[OBS_STATE].dtype,
                 )
-            kalman_raw = self.kalman_feature_norm(kalman_raw)
-            kalman_features = self.kalman_projector(kalman_raw)
+            else:
+                kalman_raw = self._get_kalman_features(batch)
+                if self.config.kalman_use_dataset_stats_norm:
+                    kalman_raw = (kalman_raw - self.kalman_stats_mean.to(kalman_raw)) / self.kalman_stats_std.to(
+                        kalman_raw
+                    )
+                kalman_raw = self.kalman_feature_norm(kalman_raw)
+                kalman_features = self.kalman_projector(kalman_raw)
             global_cond_feats.append(kalman_features)
 
         if self.config.enable_kalman_posvel6_direct_condition:
-            kalman_direct_posvel = self._compute_online_kalman_posvel6_direct_from_processed_state(batch)
+            if self.config.kalman_force_zero_global_condition:
+                kalman_direct_posvel = torch.zeros(
+                    (batch_size, n_obs_steps, 6),
+                    device=batch[OBS_STATE].device,
+                    dtype=batch[OBS_STATE].dtype,
+                )
+            else:
+                kalman_direct_posvel = self._compute_online_kalman_posvel6_direct_from_processed_state(batch)
             global_cond_feats.append(kalman_direct_posvel)
 
         if self.config.env_state_feature:
