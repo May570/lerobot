@@ -71,39 +71,22 @@ class DiffusionConfig(PreTrainedConfig):
             The group sizes are set to be about 16 (to be precise, feature_dim // 16).
         spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
         use_separate_rgb_encoder_per_camera: Whether to use a separate RGB encoder for each camera view.
-        enable_optical_flow_condition: Whether to compute a lightweight hand-crafted optical flow feature
-            from consecutive observation frames and append it to the global conditioning vector.
-        optical_flow_feature_dim: Output feature dimension for the lightweight optical-flow encoder.
-        optical_flow_kernel_size: Sobel kernel size used by the hand-crafted optical-flow approximation.
-            Supported values: 3, 5, 7.
-        optical_flow_eps: Numerical stability term used in the optical-flow closed-form approximation.
-        optical_flow_gate_init: Initial scale value for a learnable scalar gate on the optical-flow feature.
-            Set close to 0 to start from near-disabled flow and let training learn how much to use.
-        optical_flow_dropout_p: Branch dropout probability applied to optical-flow conditioning during
-            training. This stochastically removes the flow branch to reduce over-reliance on noisy flow.
-        precomputed_optical_flow_root: Optional root directory containing per-episode precomputed optical
-            flow files. When set, training/inference will try to load flow from disk instead of computing
-            hand-crafted flow online. If unavailable for a batch (e.g. env rollout without dataset indices),
-            the policy falls back to online flow computation.
-        precomputed_optical_flow_cache_size: Number of episode flow files to keep in memory-mapped cache.
-        enable_kalman_condition: Whether to add a Kalman-filtered low-dimensional branch built from
-            end-effector state observations.
-        precomputed_kalman_root: Optional root directory containing per-episode precomputed Kalman sidecar
-            arrays. When set, the policy first tries to load Kalman features from disk. If unavailable for a
-            batch (for example rollout batches without dataset indexing metadata), it falls back to online
-            Kalman computation from observation.state.
-        precomputed_kalman_cache_size: Number of episode Kalman files to keep in memory-mapped cache.
-        kalman_feature_dim: Output feature dimension after the Kalman MLP projection.
-        kalman_feature_mode: Raw Kalman feature layout before projection.
+        enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
+        kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
             - "posvel6": [pos(3), vel(3)]
-        kalman_force_zero_input: If True, bypass all Kalman data sources and always feed an all-zero
-            raw Kalman tensor into the Kalman branch. This keeps the branch architecture enabled while
-            removing any Kalman signal from disk or online computation.
+            - "vel3": [vel(3)]
+            - "velpred6": [vel(3), pred_exec(3)]
+        enable_kalman_feature_mlp: Whether to apply an MLP to Kalman features before concatenating
+            into global conditioning.
+        kalman_feature_mlp_dim: Output width of the optional Kalman MLP branch. If None, keep
+            the same width as raw Kalman features.
+        enable_kalman_feature_gate: Whether to apply a learned gate on the final Kalman
+            conditioning tensor right before concatenating into global conditioning.
+        enable_kalman_mid_only_condition: Whether Kalman conditioning is injected only at the Unet
+            mid block instead of all down/mid/up residual blocks.
         kalman_force_zero_global_condition: If True, force the Kalman-derived tensor appended to
-            global conditioning to be exactly zero. This is stricter than `kalman_force_zero_input`
-            because it guarantees zero after the MLP-projected Kalman branch as well, and it also
-            applies to the direct 6D Kalman concat branch when enabled.
+            global conditioning to be exactly zero.
         kalman_state_pos_slice: Slice in observation.state used as xyz measurement for online Kalman
             computation, in "start:end" format.
         kalman_predict_horizon: Seconds to predict forward when building the execution-time position feature.
@@ -112,30 +95,6 @@ class DiffusionConfig(PreTrainedConfig):
         kalman_accel_noise_std: Process acceleration noise standard deviation for online Kalman.
         kalman_init_pos_std: Initial position uncertainty standard deviation for online Kalman.
         kalman_init_vel_std: Initial velocity uncertainty standard deviation for online Kalman.
-        kalman_use_dataset_stats_norm: Whether to apply fixed per-dimension dataset statistics
-            normalization to raw Kalman features before LayerNorm+MLP.
-        kalman_stats_path: Optional path to a JSON file with {"mean":[D], "std":[D]} for Kalman
-            feature normalization, where D is 10 for "full10" and 6 for "posvel6".
-            If unset, code will try <precomputed_kalman_root>/normalization.json.
-        kalman_norm_eps: Numerical stability epsilon used when dividing by std.
-        enable_kalman_posvel6_direct_condition: Independent Kalman conditioning branch that always runs
-            online from processed `observation.state` (post-preprocessor). It outputs a 6D tensor
-            [pos_input(3), kalman_vel(3)] per observation step and concatenates it directly into
-            global conditioning (no LayerNorm/MLP projection).
-        enable_online_gmflow_rollout: Whether to run GMFlow online during rollout (`select_action`) and
-            inject the result as `precomputed_flow_*` tensors for conditioning. When disabled, rollout
-            behavior is unchanged and falls back to hand-crafted online flow if needed.
-        online_gmflow_repo_path: Path to the GMFlow repository root (the folder containing `gmflow/` and
-            `utils/` modules) used for dynamic import during rollout.
-        online_gmflow_checkpoint: Path to a GMFlow checkpoint file for online rollout inference.
-        online_gmflow_use_amp: Whether to enable AMP autocast when online GMFlow runs on CUDA.
-        online_gmflow_padding_factor: Padding factor passed to GMFlow `InputPadder`.
-        online_gmflow_attn_splits_list: Attention split list passed to GMFlow forward.
-        online_gmflow_corr_radius_list: Correlation radius list passed to GMFlow forward.
-        online_gmflow_prop_radius_list: Propagation radius list passed to GMFlow forward.
-        enable_online_groundedsam2_mask_rollout: Whether to apply a Grounded-SAM2 mask online during
-            rollout and keep only local flow regions (`flow * mask`) before optical-flow encoding.
-            This switch only affects rollout (`select_action`) and does not change training logic.
         down_dims: Feature dimension for each stage of temporal downsampling in the diffusion modeling Unet.
             You may provide a variable number of dimensions, therefore also controlling the degree of
             downsampling.
@@ -193,22 +152,13 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
-    # Experimental: hand-crafted optical flow conditioning.
-    enable_optical_flow_condition: bool = False
-    optical_flow_feature_dim: int = 64
-    optical_flow_kernel_size: int = 3
-    optical_flow_eps: float = 1e-3
-    optical_flow_gate_init: float = 0.1
-    optical_flow_dropout_p: float = 0.3
-    precomputed_optical_flow_root: str | None = None
-    precomputed_optical_flow_cache_size: int = 8
-    # Experimental: Kalman-conditioned low-dimensional branch.
+    # Experimental: direct online Kalman conditioning branch.
     enable_kalman_condition: bool = False
-    precomputed_kalman_root: str | None = None
-    precomputed_kalman_cache_size: int = 8
-    kalman_feature_dim: int = 32
     kalman_feature_mode: str = "full10"
-    kalman_force_zero_input: bool = False
+    enable_kalman_feature_mlp: bool = False
+    kalman_feature_mlp_dim: int | None = None
+    enable_kalman_feature_gate: bool = False
+    enable_kalman_mid_only_condition: bool = False
     kalman_force_zero_global_condition: bool = False
     kalman_state_pos_slice: str = "0:3"
     kalman_predict_horizon: float = 0.1
@@ -217,24 +167,6 @@ class DiffusionConfig(PreTrainedConfig):
     kalman_accel_noise_std: float = 0.4
     kalman_init_pos_std: float = 0.05
     kalman_init_vel_std: float = 0.5
-    kalman_use_dataset_stats_norm: bool = True
-    kalman_stats_path: str | None = None
-    kalman_norm_eps: float = 1e-6
-    # Independent branch: online Kalman velocity + direct 6D [pos, vel] concat.
-    enable_kalman_posvel6_direct_condition: bool = False
-    # Rollout-only: keep a persistent online Kalman filter state across env steps.
-    # When enabled, select_action injects precomputed_kalman_* keys from streaming state observations,
-    # which better matches long-horizon precompute than recomputing from short n_obs_steps windows.
-    enable_online_kalman_rollout_stateful: bool = False
-    enable_online_gmflow_rollout: bool = False
-    online_gmflow_repo_path: str | None = None
-    online_gmflow_checkpoint: str | None = None
-    online_gmflow_use_amp: bool = True
-    online_gmflow_padding_factor: int = 8
-    online_gmflow_attn_splits_list: tuple[int, ...] = (2,)
-    online_gmflow_corr_radius_list: tuple[int, ...] = (-1,)
-    online_gmflow_prop_radius_list: tuple[int, ...] = (-1,)
-    enable_online_groundedsam2_mask_rollout: bool = False
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
@@ -289,42 +221,14 @@ class DiffusionConfig(PreTrainedConfig):
                 f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
                 f"Got {self.noise_scheduler_type}."
             )
-        if self.optical_flow_kernel_size not in {3, 5, 7}:
+        if self.kalman_feature_mode not in {"full10", "posvel6", "vel3", "velpred6"}:
             raise ValueError(
-                f"`optical_flow_kernel_size` must be one of (3, 5, 7). Got {self.optical_flow_kernel_size}."
-            )
-        if self.optical_flow_feature_dim <= 0:
-            raise ValueError(
-                f"`optical_flow_feature_dim` must be > 0. Got {self.optical_flow_feature_dim}."
-            )
-        if self.optical_flow_eps <= 0:
-            raise ValueError(f"`optical_flow_eps` must be > 0. Got {self.optical_flow_eps}.")
-        if not (0.0 <= self.optical_flow_gate_init <= 1.0):
-            raise ValueError(
-                "`optical_flow_gate_init` must be in [0, 1]. "
-                f"Got {self.optical_flow_gate_init}."
-            )
-        if not (0.0 <= self.optical_flow_dropout_p < 1.0):
-            raise ValueError(
-                "`optical_flow_dropout_p` must be in [0, 1). "
-                f"Got {self.optical_flow_dropout_p}."
-            )
-        if self.precomputed_optical_flow_cache_size <= 0:
-            raise ValueError(
-                "`precomputed_optical_flow_cache_size` must be > 0. "
-                f"Got {self.precomputed_optical_flow_cache_size}."
-            )
-        if self.precomputed_kalman_cache_size <= 0:
-            raise ValueError(
-                "`precomputed_kalman_cache_size` must be > 0. "
-                f"Got {self.precomputed_kalman_cache_size}."
-            )
-        if self.kalman_feature_dim <= 0:
-            raise ValueError(f"`kalman_feature_dim` must be > 0. Got {self.kalman_feature_dim}.")
-        if self.kalman_feature_mode not in {"full10", "posvel6"}:
-            raise ValueError(
-                "`kalman_feature_mode` must be one of {'full10', 'posvel6'}. "
+                "`kalman_feature_mode` must be one of {'full10', 'posvel6', 'vel3', 'velpred6'}. "
                 f"Got {self.kalman_feature_mode}."
+            )
+        if self.kalman_feature_mlp_dim is not None and self.kalman_feature_mlp_dim <= 0:
+            raise ValueError(
+                f"`kalman_feature_mlp_dim` must be > 0 when set. Got {self.kalman_feature_mlp_dim}."
             )
         if self.kalman_predict_horizon < 0:
             raise ValueError(
@@ -342,8 +246,6 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(f"`kalman_init_pos_std` must be > 0. Got {self.kalman_init_pos_std}.")
         if self.kalman_init_vel_std <= 0:
             raise ValueError(f"`kalman_init_vel_std` must be > 0. Got {self.kalman_init_vel_std}.")
-        if self.kalman_norm_eps <= 0:
-            raise ValueError(f"`kalman_norm_eps` must be > 0. Got {self.kalman_norm_eps}.")
         parts = self.kalman_state_pos_slice.split(":")
         if len(parts) != 2:
             raise ValueError(
@@ -355,32 +257,6 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 "`kalman_state_pos_slice` must select exactly 3 dimensions for xyz. "
                 f"Got {self.kalman_state_pos_slice}."
-            )
-        if self.enable_online_kalman_rollout_stateful and not self.enable_kalman_condition:
-            raise ValueError(
-                "`enable_online_kalman_rollout_stateful=True` requires `enable_kalman_condition=True`."
-            )
-        if self.enable_online_gmflow_rollout and not self.enable_optical_flow_condition:
-            raise ValueError(
-                "`enable_online_gmflow_rollout=True` requires `enable_optical_flow_condition=True`."
-            )
-        if self.enable_online_gmflow_rollout and not self.online_gmflow_repo_path:
-            raise ValueError(
-                "`online_gmflow_repo_path` must be set when `enable_online_gmflow_rollout=True`."
-            )
-        if self.enable_online_groundedsam2_mask_rollout and not self.enable_online_gmflow_rollout:
-            raise ValueError(
-                "`enable_online_groundedsam2_mask_rollout=True` requires "
-                "`enable_online_gmflow_rollout=True`."
-            )
-        if self.enable_online_gmflow_rollout and not self.online_gmflow_checkpoint:
-            raise ValueError(
-                "`online_gmflow_checkpoint` must be set when `enable_online_gmflow_rollout=True`."
-            )
-        if self.online_gmflow_padding_factor <= 0:
-            raise ValueError(
-                "`online_gmflow_padding_factor` must be > 0. "
-                f"Got {self.online_gmflow_padding_factor}."
             )
 
         if self.resize_shape is not None and (

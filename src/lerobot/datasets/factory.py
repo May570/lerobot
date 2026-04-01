@@ -110,8 +110,6 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
                 tolerance_s=cfg.tolerance_s,
-                precomputed_optical_flow_root=getattr(cfg.policy, "precomputed_optical_flow_root", None),
-                precomputed_optical_flow_cache_size=getattr(cfg.policy, "precomputed_optical_flow_cache_size", 8),
             )
         else:
             dataset = StreamingLeRobotDataset(

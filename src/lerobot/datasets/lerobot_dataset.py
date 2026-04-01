@@ -15,11 +15,9 @@
 # limitations under the License.
 import concurrent.futures
 import contextlib
-import json
 import logging
 import shutil
 import tempfile
-from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 
@@ -83,7 +81,6 @@ from lerobot.datasets.video_utils import (
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 CODEBASE_VERSION = "v3.0"
-PRECOMPUTED_FLOW_PREFIX = "precomputed_flow_"
 
 
 class LeRobotDatasetMetadata:
@@ -584,8 +581,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
-        precomputed_optical_flow_root: str | None = None,
-        precomputed_optical_flow_cache_size: int = 8,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -723,17 +718,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.episodes_since_last_encoding = 0
         self.vcodec = resolve_vcodec(vcodec)
         self._encoder_threads = encoder_threads
-        self.precomputed_optical_flow_root = (
-            Path(precomputed_optical_flow_root) if precomputed_optical_flow_root else None
-        )
-        self.precomputed_optical_flow_cache_size = precomputed_optical_flow_cache_size
-        self._precomputed_flow_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
-        self._precomputed_flow_key_cache: dict[int, dict[str, str]] = {}
-
-        if self.precomputed_optical_flow_root is not None and not self.precomputed_optical_flow_root.exists():
-            raise FileNotFoundError(
-                f"Precomputed optical-flow root does not exist: {self.precomputed_optical_flow_root}"
-            )
 
         # Unused attributes
         self.image_writer = None
@@ -1082,108 +1066,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         return item
 
-    @staticmethod
-    def _flow_aliases_for_camera_key(camera_key: str) -> list[str]:
-        if "observation.images." in camera_key:
-            suffix = camera_key.split("observation.images.", maxsplit=1)[1]
-        else:
-            suffix = camera_key.split(".")[-1]
-
-        aliases = [suffix]
-        if suffix == "image2":
-            aliases.insert(0, "wrist_image")
-        if suffix == "wrist_image" and "image2" not in aliases:
-            aliases.append("image2")
-        if suffix == "image":
-            aliases.insert(0, "image")
-
-        seen = set()
-        ordered = []
-        for alias in aliases:
-            if alias not in seen:
-                seen.add(alias)
-                ordered.append(alias)
-        return ordered
-
-    def _load_precomputed_flow_arrays(self, episode_index: int) -> dict[str, np.ndarray]:
-        if episode_index in self._precomputed_flow_cache:
-            arrays = self._precomputed_flow_cache.pop(episode_index)
-            self._precomputed_flow_cache[episode_index] = arrays
-            return arrays
-
-        ep_dir = self.precomputed_optical_flow_root / f"episode_{episode_index:06d}"
-        index_path = ep_dir / "arrays.json"
-        if not index_path.exists():
-            raise FileNotFoundError(f"Missing precomputed flow metadata file: {index_path}")
-        with index_path.open("r", encoding="utf-8") as f:
-            metadata = json.load(f)
-        arrays = {
-            key: np.load(ep_dir / f"{key}.npy", mmap_mode="r", allow_pickle=False)
-            for key in metadata.keys()
-        }
-        self._precomputed_flow_cache[episode_index] = arrays
-
-        while len(self._precomputed_flow_cache) > self.precomputed_optical_flow_cache_size:
-            old_episode, _ = self._precomputed_flow_cache.popitem(last=False)
-            self._precomputed_flow_key_cache.pop(old_episode, None)
-
-        return arrays
-
-    def _resolve_flow_key_for_camera(self, arrays: dict[str, np.ndarray], camera_key: str) -> str:
-        array_keys = set(arrays.keys())
-        for alias in self._flow_aliases_for_camera_key(camera_key):
-            key = f"flow_{alias}"
-            if key in array_keys:
-                return key
-        raise KeyError(
-            f"Could not resolve precomputed flow key for camera '{camera_key}'. "
-            f"Available keys: {sorted(array_keys)}"
-        )
-
-    def _attach_precomputed_flow_maps(
-        self,
-        item: dict,
-        *,
-        abs_idx: int,
-        ep_idx: int,
-        query_indices: dict[str, list[int]] | None,
-    ) -> dict:
-        if self.precomputed_optical_flow_root is None:
-            return item
-
-        ep_start = int(self.meta.episodes[ep_idx]["dataset_from_index"])
-        arrays = self._load_precomputed_flow_arrays(ep_idx)
-        dataset_indices = arrays["dataset_index"]
-
-        if ep_idx not in self._precomputed_flow_key_cache:
-            self._precomputed_flow_key_cache[ep_idx] = {
-                cam_key: self._resolve_flow_key_for_camera(arrays, cam_key)
-                for cam_key in self.meta.camera_keys
-            }
-
-        for cam_key in self.meta.camera_keys:
-            q_idx = query_indices[cam_key] if query_indices is not None and cam_key in query_indices else [abs_idx]
-            local_idx = np.asarray(q_idx, dtype=np.int64) - ep_start
-            if (local_idx < 0).any() or (local_idx >= dataset_indices.shape[0]).any():
-                raise IndexError(
-                    f"Precomputed flow local index out of range for episode={ep_idx}, camera={cam_key}. "
-                    f"local_idx_min={int(local_idx.min())}, local_idx_max={int(local_idx.max())}, "
-                    f"episode_len={dataset_indices.shape[0]}"
-                )
-            expected = np.asarray(q_idx, dtype=np.int64)
-            if not np.array_equal(dataset_indices[local_idx], expected):
-                raise ValueError(
-                    f"Precomputed flow index mismatch for episode={ep_idx}, camera={cam_key}. "
-                    f"Expected first={int(expected[0])}, got={int(dataset_indices[local_idx][0])}"
-                )
-
-            flow_key = self._precomputed_flow_key_cache[ep_idx][cam_key]
-            flow_hw2 = arrays[flow_key][local_idx]
-            flow_tensor = torch.from_numpy(np.asarray(flow_hw2)).permute(0, 3, 1, 2).contiguous()
-            item[f"{PRECOMPUTED_FLOW_PREFIX}{flow_key.removeprefix('flow_')}"] = flow_tensor
-
-        return item
-
     def _ensure_hf_dataset_loaded(self):
         """Lazy load the HF dataset only when needed for reading."""
         if self._lazy_loading or self.hf_dataset is None:
@@ -1218,13 +1100,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
-
-        item = self._attach_precomputed_flow_maps(
-            item,
-            abs_idx=abs_idx,
-            ep_idx=ep_idx,
-            query_indices=query_indices,
-        )
 
         if self.image_transforms is not None:
             image_keys = self.meta.camera_keys

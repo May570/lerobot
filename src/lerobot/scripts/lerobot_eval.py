@@ -81,7 +81,7 @@ from lerobot.envs.utils import (
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
-from lerobot.utils.constants import ACTION, DONE, OBS_STATE, OBS_STATE_RAW, OBS_STR, REWARD
+from lerobot.utils.constants import ACTION, DONE, OBS_STATE, OBS_STR, REWARD
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.libero_compat import (
@@ -176,17 +176,7 @@ def rollout(
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
-        raw_state_for_kalman = None
-        if OBS_STATE in observation:
-            raw_state_for_kalman = observation[OBS_STATE].detach().clone()
-
         observation = preprocessor(observation)
-        # For stateful online Kalman rollout, keep an explicit unnormalized state copy.
-        if raw_state_for_kalman is not None and OBS_STATE in observation:
-            raw_state_for_kalman = raw_state_for_kalman.to(
-                device=observation[OBS_STATE].device, dtype=observation[OBS_STATE].dtype
-            )
-            observation[OBS_STATE_RAW] = raw_state_for_kalman
         # Inject deterministic rollout timestamps based on env fps for stable dt.
         if rollout_fps is not None and rollout_fps > 0 and OBS_STATE in observation:
             batch_size = int(observation[OBS_STATE].shape[0])

@@ -22,9 +22,13 @@ from lerobot.processor.rename_processor import RenameObservationsProcessorStep
 # Mapping from legacy local dataset keys to canonical LIBERO observation keys.
 LIBERO_LEGACY_OBS_RENAME_MAP = {
     "actions": "action",
+    "actions_is_pad": "action_is_pad",
     "image": "observation.images.image",
+    "image_is_pad": "observation.images.image_is_pad",
     "wrist_image": "observation.images.image2",
+    "wrist_image_is_pad": "observation.images.image2_is_pad",
     "state": "observation.state",
+    "state_is_pad": "observation.state_is_pad",
 }
 
 

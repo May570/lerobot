@@ -142,9 +142,9 @@ class AddBatchDimensionComplementaryDataStep(ComplementaryDataProcessorStep):
     """
     Processor step to add a batch dimension to complementary data fields.
 
-    Handles specific keys like 'task', 'index', 'frame_index', 'episode_index', and 'task_index' to make them batched.
+    Handles specific keys like 'task', 'index', and 'task_index' to make them batched.
     - 'task' (str) is wrapped in a list.
-    - 'index', 'frame_index', 'episode_index' and 'task_index' (0D tensors) get a batch dimension.
+    - 'index' and 'task_index' (0D tensors) get a batch dimension.
     """
 
     def complementary_data(self, complementary_data: dict) -> dict:
@@ -174,18 +174,6 @@ class AddBatchDimensionComplementaryDataStep(ComplementaryDataProcessorStep):
             task_index_value = complementary_data["task_index"]
             if isinstance(task_index_value, Tensor) and task_index_value.dim() == 0:
                 complementary_data["task_index"] = task_index_value.unsqueeze(0)
-
-        # Process frame_index field - add batch dim if 0D
-        if "frame_index" in complementary_data:
-            frame_index_value = complementary_data["frame_index"]
-            if isinstance(frame_index_value, Tensor) and frame_index_value.dim() == 0:
-                complementary_data["frame_index"] = frame_index_value.unsqueeze(0)
-
-        # Process episode_index field - add batch dim if 0D
-        if "episode_index" in complementary_data:
-            episode_index_value = complementary_data["episode_index"]
-            if isinstance(episode_index_value, Tensor) and episode_index_value.dim() == 0:
-                complementary_data["episode_index"] = episode_index_value.unsqueeze(0)
         return complementary_data
 
     def transform_features(
