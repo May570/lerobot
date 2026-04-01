@@ -71,6 +71,22 @@ class DiffusionConfig(PreTrainedConfig):
             The group sizes are set to be about 16 (to be precise, feature_dim // 16).
         spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
         use_separate_rgb_encoder_per_camera: Whether to use a separate RGB encoder for each camera view.
+        enable_future_predictor: Whether to enable the lightweight future predictor branch.
+        future_predictor_type: Future predictor architecture. Supported options: ["mlp", "gru"].
+        future_target_type: Future supervision target. Supported options: ["future_feature", "future_delta"].
+        future_training_stage: Future training stage. Supported options: ["joint", "pretrain"].
+            - "joint": optimize policy loss + lambda_future * future loss.
+            - "pretrain": optimize only lambda_future * future loss.
+        future_num_input_steps: Number of historical encoded feature steps used by the future predictor input.
+        future_predictor_hidden_dim: Hidden width used by the lightweight future predictor.
+        future_condition_fusion: How to fuse future branch into policy conditioning.
+            - "concat": direct concat [h_t, future_branch_output]
+            - "project_concat": first project [h_t, future_branch_output], then concat projected vector
+              to policy conditioning.
+        future_condition_proj_dim: Output width of future projection when using "project_concat".
+        lambda_future: Future loss weight for joint/pretrain objective.
+        future_cosine_loss_weight: Optional cosine loss weight added to MSE future loss.
+        future_freeze_encoder: Whether to freeze the image observation encoder while training future-enabled DP.
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
         kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
@@ -152,6 +168,18 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+    # Experimental: lightweight future latent predictor branch.
+    enable_future_predictor: bool = False
+    future_predictor_type: str = "mlp"
+    future_target_type: str = "future_feature"
+    future_training_stage: str = "joint"
+    future_num_input_steps: int = 1
+    future_predictor_hidden_dim: int = 256
+    future_condition_fusion: str = "concat"
+    future_condition_proj_dim: int | None = None
+    lambda_future: float = 1.0
+    future_cosine_loss_weight: float = 0.0
+    future_freeze_encoder: bool = False
     # Experimental: direct online Kalman conditioning branch.
     enable_kalman_condition: bool = False
     kalman_feature_mode: str = "full10"
@@ -225,6 +253,66 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 "`kalman_feature_mode` must be one of {'full10', 'posvel6', 'vel3', 'velpred6'}. "
                 f"Got {self.kalman_feature_mode}."
+            )
+        if self.future_predictor_type not in {"mlp", "gru"}:
+            raise ValueError(
+                "`future_predictor_type` must be one of {'mlp', 'gru'}. "
+                f"Got {self.future_predictor_type}."
+            )
+        if self.future_target_type not in {"future_feature", "future_delta"}:
+            raise ValueError(
+                "`future_target_type` must be one of {'future_feature', 'future_delta'}. "
+                f"Got {self.future_target_type}."
+            )
+        if self.future_training_stage not in {"joint", "pretrain"}:
+            raise ValueError(
+                "`future_training_stage` must be one of {'joint', 'pretrain'}. "
+                f"Got {self.future_training_stage}."
+            )
+        if self.future_condition_fusion not in {"concat", "project_concat"}:
+            raise ValueError(
+                "`future_condition_fusion` must be one of {'concat', 'project_concat'}. "
+                f"Got {self.future_condition_fusion}."
+            )
+        if self.future_num_input_steps <= 0:
+            raise ValueError(
+                f"`future_num_input_steps` must be > 0. Got {self.future_num_input_steps}."
+            )
+        if self.future_predictor_hidden_dim <= 0:
+            raise ValueError(
+                f"`future_predictor_hidden_dim` must be > 0. Got {self.future_predictor_hidden_dim}."
+            )
+        if self.lambda_future < 0:
+            raise ValueError(f"`lambda_future` must be >= 0. Got {self.lambda_future}.")
+        if self.future_cosine_loss_weight < 0:
+            raise ValueError(
+                "`future_cosine_loss_weight` must be >= 0. "
+                f"Got {self.future_cosine_loss_weight}."
+            )
+        if self.future_condition_proj_dim is not None and self.future_condition_proj_dim <= 0:
+            raise ValueError(
+                "`future_condition_proj_dim` must be > 0 when set. "
+                f"Got {self.future_condition_proj_dim}."
+            )
+        if self.future_training_stage == "pretrain" and not self.enable_future_predictor:
+            raise ValueError(
+                "`future_training_stage='pretrain'` requires `enable_future_predictor=True`."
+            )
+        if self.enable_future_predictor:
+            if self.future_num_input_steps > self.n_obs_steps:
+                raise ValueError(
+                    "`future_num_input_steps` must be <= `n_obs_steps` when future predictor is enabled. "
+                    f"Got {self.future_num_input_steps=} and {self.n_obs_steps=}."
+                )
+            if self.lambda_future > 0 and self.future_num_input_steps >= self.n_obs_steps:
+                raise ValueError(
+                    "Future loss supervision needs at least one-step shift. Require "
+                    "`future_num_input_steps < n_obs_steps` when `lambda_future > 0`. "
+                    f"Got {self.future_num_input_steps=} and {self.n_obs_steps=}."
+                )
+        if self.future_training_stage == "pretrain" and self.lambda_future <= 0:
+            raise ValueError(
+                "`future_training_stage='pretrain'` requires `lambda_future > 0`."
             )
         if self.kalman_feature_mlp_dim is not None and self.kalman_feature_mlp_dim <= 0:
             raise ValueError(

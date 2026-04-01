@@ -34,6 +34,7 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.policies.diffusion.future_predictor import FuturePredictor
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import (
     get_device_from_parameters,
@@ -77,7 +78,10 @@ class DiffusionPolicy(PreTrainedPolicy):
         self.reset()
 
     def get_optim_params(self) -> dict:
-        return self.diffusion.parameters()
+        params = [param for param in self.diffusion.parameters() if param.requires_grad]
+        if not params:
+            raise ValueError("No trainable parameters found for DiffusionPolicy.")
+        return params
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -138,7 +142,7 @@ class DiffusionPolicy(PreTrainedPolicy):
         action = self._queues[ACTION].popleft()
         return action
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -146,9 +150,8 @@ class DiffusionPolicy(PreTrainedPolicy):
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        loss = self.diffusion.compute_loss(batch)
-        # no output_dict so returning None
-        return loss, None
+        loss, output_dict = self.diffusion.compute_loss_and_metrics(batch)
+        return loss, output_dict
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -178,8 +181,12 @@ class DiffusionModel(nn.Module):
         self._kalman_pos_slice = self._parse_kalman_pos_slice(self.config.kalman_state_pos_slice)
         self._kalman_raw_dim = 0
         self._kalman_cond_dim = 0
+        self._obs_feature_dim = 0
+        self._future_condition_dim = 0
         self.kalman_feature_mlp: nn.Module | None = None
         self.kalman_feature_gate: nn.Module | None = None
+        self.future_predictor: FuturePredictor | None = None
+        self.future_condition_projection: nn.Module | None = None
 
         # Build observation encoders (depending on which observations are provided).
         non_kalman_global_cond_dim = self.config.robot_state_feature.shape[0]
@@ -194,6 +201,27 @@ class DiffusionModel(nn.Module):
                 non_kalman_global_cond_dim += self.rgb_encoder.feature_dim * num_images
         if self.config.env_state_feature:
             non_kalman_global_cond_dim += self.config.env_state_feature.shape[0]
+        self._obs_feature_dim = non_kalman_global_cond_dim
+
+        if self.config.enable_future_predictor:
+            self.future_predictor = FuturePredictor(
+                predictor_type=self.config.future_predictor_type,
+                input_dim=self._obs_feature_dim,
+                output_dim=self._obs_feature_dim,
+                hidden_dim=self.config.future_predictor_hidden_dim,
+                num_input_steps=self.config.future_num_input_steps,
+            )
+            raw_future_concat_dim = self._obs_feature_dim * 2
+            if self.config.future_condition_fusion == "project_concat":
+                project_dim = (
+                    self.config.future_condition_proj_dim
+                    if self.config.future_condition_proj_dim is not None
+                    else self._obs_feature_dim
+                )
+                self.future_condition_projection = nn.Linear(raw_future_concat_dim, project_dim)
+                self._future_condition_dim = project_dim
+            else:
+                self._future_condition_dim = raw_future_concat_dim
 
         kalman_cond_dim = 0
         if self.config.enable_kalman_condition:
@@ -219,14 +247,18 @@ class DiffusionModel(nn.Module):
         if self.config.enable_kalman_condition and self.config.enable_kalman_mid_only_condition:
             self.unet = DiffusionConditionalUnet1d(
                 config,
-                global_cond_dim=non_kalman_global_cond_dim * config.n_obs_steps,
-                global_cond_mid_dim=full_global_cond_dim * config.n_obs_steps,
+                global_cond_dim=(
+                    non_kalman_global_cond_dim * config.n_obs_steps + self._future_condition_dim
+                ),
+                global_cond_mid_dim=full_global_cond_dim * config.n_obs_steps + self._future_condition_dim,
             )
         else:
             self.unet = DiffusionConditionalUnet1d(
                 config,
-                global_cond_dim=full_global_cond_dim * config.n_obs_steps,
+                global_cond_dim=full_global_cond_dim * config.n_obs_steps + self._future_condition_dim,
             )
+
+        self._apply_future_trainable_rules()
 
         if config.compile_model:
             # Compile the U-Net. "reduce-overhead" is preferred for the small-batch repetitive loops
@@ -257,6 +289,137 @@ class DiffusionModel(nn.Module):
         start = int(parts[0]) if parts[0] else None
         end = int(parts[1]) if parts[1] else None
         return slice(start, end)
+
+    def _apply_future_trainable_rules(self) -> None:
+        if not self.config.enable_future_predictor:
+            return
+
+        if self.config.future_training_stage == "pretrain":
+            for parameter in self.parameters():
+                parameter.requires_grad_(False)
+            if self.future_predictor is None:
+                raise ValueError("Future predictor should be initialized in pretrain stage.")
+            for parameter in self.future_predictor.parameters():
+                parameter.requires_grad_(True)
+            return
+
+        if self.config.future_freeze_encoder and self.config.image_features:
+            if self.config.use_separate_rgb_encoder_per_camera:
+                for encoder in self.rgb_encoder:
+                    for parameter in encoder.parameters():
+                        parameter.requires_grad_(False)
+            else:
+                for parameter in self.rgb_encoder.parameters():
+                    parameter.requires_grad_(False)
+
+    def _extract_obs_step_features(self, batch: dict[str, Tensor]) -> Tensor:
+        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        obs_features = [batch[OBS_STATE]]
+        if self.config.image_features:
+            if self.config.use_separate_rgb_encoder_per_camera:
+                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
+                img_features_list = torch.cat(
+                    [
+                        encoder(images)
+                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                    ]
+                )
+                img_features = einops.rearrange(
+                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                )
+            else:
+                img_features = self.rgb_encoder(
+                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+                )
+                img_features = einops.rearrange(
+                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                )
+            obs_features.append(img_features)
+        if self.config.env_state_feature:
+            obs_features.append(batch[OBS_ENV_STATE])
+        return torch.cat(obs_features, dim=-1)
+
+    def _predict_future_outputs(self, input_seq: Tensor) -> tuple[Tensor, Tensor]:
+        if self.future_predictor is None:
+            raise ValueError("Future predictor is not initialized.")
+
+        predictor_raw = self.future_predictor(input_seq)
+        current_feature = input_seq[:, -1, :]
+        if self.config.future_target_type == "future_feature":
+            predicted_future = predictor_raw
+            predicted_delta = predicted_future - current_feature
+        elif self.config.future_target_type == "future_delta":
+            predicted_delta = predictor_raw
+            predicted_future = current_feature + predicted_delta
+        else:
+            raise ValueError(f"Unsupported future target type: {self.config.future_target_type}")
+
+        return predicted_future, predicted_delta
+
+    def _build_future_condition(self, obs_step_features: Tensor) -> Tensor:
+        if self.future_predictor is None:
+            raise ValueError("Future predictor is not initialized.")
+
+        n_input_steps = self.config.future_num_input_steps
+        if obs_step_features.shape[1] < n_input_steps:
+            raise ValueError(
+                "Not enough observation steps for future conditioning. "
+                f"Need at least {n_input_steps}, got {obs_step_features.shape[1]}."
+            )
+
+        predictor_input = obs_step_features[:, -n_input_steps:, :]
+        predicted_future, predicted_delta = self._predict_future_outputs(predictor_input)
+        current_feature = predictor_input[:, -1, :]
+        future_branch = (
+            predicted_future if self.config.future_target_type == "future_feature" else predicted_delta
+        )
+        future_condition = torch.cat([current_feature, future_branch], dim=-1)
+        if self.future_condition_projection is not None:
+            future_condition = self.future_condition_projection(future_condition)
+        return future_condition
+
+    def _compute_future_loss(self, obs_step_features: Tensor) -> tuple[Tensor, dict]:
+        if self.future_predictor is None:
+            raise ValueError("Future predictor is not initialized.")
+
+        n_input_steps = self.config.future_num_input_steps
+        if obs_step_features.shape[1] < n_input_steps + 1:
+            raise ValueError(
+                "Not enough observation steps for one-step future supervision. "
+                f"Need at least {n_input_steps + 1}, got {obs_step_features.shape[1]}."
+            )
+
+        # Train on a one-step shifted pair so inference can still use the latest observation window.
+        predictor_input = obs_step_features[:, -(n_input_steps + 1) : -1, :]
+        current_feature = predictor_input[:, -1, :]
+        target_future = obs_step_features[:, -1, :]
+
+        predicted_future, predicted_delta = self._predict_future_outputs(predictor_input)
+        if self.config.future_target_type == "future_feature":
+            supervised_pred = predicted_future
+            supervised_target = target_future
+        else:
+            supervised_pred = predicted_delta
+            supervised_target = target_future - current_feature
+
+        mse_loss = F.mse_loss(supervised_pred, supervised_target)
+        cosine_loss = torch.zeros_like(mse_loss)
+        if self.config.future_cosine_loss_weight > 0:
+            cosine_similarity = F.cosine_similarity(
+                supervised_pred,
+                supervised_target,
+                dim=-1,
+                eps=1e-8,
+            )
+            cosine_loss = 1.0 - cosine_similarity.mean()
+
+        future_loss = mse_loss + self.config.future_cosine_loss_weight * cosine_loss
+        metrics = {
+            "future_loss_mse": float(mse_loss.detach().item()),
+            "future_loss_cosine": float(cosine_loss.detach().item()),
+            "future_loss_raw": float(future_loss.detach().item()),
+        }
+        return future_loss, metrics
 
     # ========= inference  ============
     def conditional_sample(
@@ -297,44 +460,23 @@ class DiffusionModel(nn.Module):
 
         return sample
 
-    def _prepare_unet_conditioning(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor | None]:
+    def _prepare_unet_conditioning_and_aux(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[Tensor, Tensor | None, Tensor]:
         """
-        Prepare conditioning tensors.
+        Prepare conditioning tensors and return per-step observation features.
 
         Returns:
-            (global_cond, global_cond_mid)
-            - default path: (full_cond, None)
-            - kalman mid-only path: (non_kalman_cond, full_cond)
+            (global_cond, global_cond_mid, obs_step_features)
+            - default path: (full_cond, None, obs_step_features)
+            - kalman mid-only path: (non_kalman_cond, full_cond, obs_step_features)
         """
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        non_kalman_feats = [batch[OBS_STATE]]
-        # Extract image features.
-        if self.config.image_features:
-            if self.config.use_separate_rgb_encoder_per_camera:
-                # Combine batch and sequence dims while rearranging to make the camera index dimension first.
-                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                img_features_list = torch.cat(
-                    [
-                        encoder(images)
-                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                    ]
-                )
-                # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
-            else:
-                # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
-                img_features = self.rgb_encoder(
-                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                )
-                # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
-            non_kalman_feats.append(img_features)
+        obs_step_features = self._extract_obs_step_features(batch)
+
+        future_condition: Tensor | None = None
+        if self.config.enable_future_predictor:
+            future_condition = self._build_future_condition(obs_step_features)
 
         kalman_features: Tensor | None = None
         if self.config.enable_kalman_condition:
@@ -343,7 +485,6 @@ class DiffusionModel(nn.Module):
                 kalman_features = self.kalman_feature_mlp(kalman_features)
             if self.kalman_feature_gate is not None:
                 kalman_features = kalman_features * self.kalman_feature_gate(kalman_features)
-            # Force-zero is defined on the final tensor that is injected into U-Net conditioning.
             if self.config.kalman_force_zero_global_condition:
                 kalman_features = torch.zeros(
                     (batch_size, n_obs_steps, self._kalman_cond_dim),
@@ -351,19 +492,23 @@ class DiffusionModel(nn.Module):
                     dtype=batch[OBS_STATE].dtype,
                 )
 
-        if self.config.env_state_feature:
-            non_kalman_feats.append(batch[OBS_ENV_STATE])
+        non_kalman_cond = obs_step_features.flatten(start_dim=1)
+        if future_condition is not None:
+            non_kalman_cond = torch.cat([non_kalman_cond, future_condition], dim=-1)
 
-        non_kalman_cond = torch.cat(non_kalman_feats, dim=-1).flatten(start_dim=1)
         if kalman_features is None:
-            return non_kalman_cond, None
+            return non_kalman_cond, None, obs_step_features
 
-        full_cond = torch.cat([torch.cat(non_kalman_feats, dim=-1), kalman_features], dim=-1).flatten(
-            start_dim=1
-        )
+        full_cond = torch.cat([obs_step_features, kalman_features], dim=-1).flatten(start_dim=1)
+        if future_condition is not None:
+            full_cond = torch.cat([full_cond, future_condition], dim=-1)
         if self.config.enable_kalman_mid_only_condition:
-            return non_kalman_cond, full_cond
-        return full_cond, None
+            return non_kalman_cond, full_cond, obs_step_features
+        return full_cond, None, obs_step_features
+
+    def _prepare_unet_conditioning(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor | None]:
+        global_cond, global_cond_mid, _ = self._prepare_unet_conditioning_and_aux(batch)
+        return global_cond, global_cond_mid
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Backward-compatible full global conditioning tensor."""
@@ -524,7 +669,47 @@ class DiffusionModel(nn.Module):
 
         return actions
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+    def _compute_policy_loss(
+        self,
+        batch: dict[str, Tensor],
+        global_cond: Tensor,
+        global_cond_mid: Tensor | None,
+    ) -> Tensor:
+        trajectory = batch[ACTION]
+        eps = torch.randn(trajectory.shape, device=trajectory.device)
+        timesteps = torch.randint(
+            low=0,
+            high=self.noise_scheduler.config.num_train_timesteps,
+            size=(trajectory.shape[0],),
+            device=trajectory.device,
+        ).long()
+        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
+        pred = self.unet(
+            noisy_trajectory,
+            timesteps,
+            global_cond=global_cond,
+            global_cond_mid=global_cond_mid,
+        )
+
+        if self.config.prediction_type == "epsilon":
+            target = eps
+        elif self.config.prediction_type == "sample":
+            target = batch[ACTION]
+        else:
+            raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
+
+        policy_loss = F.mse_loss(pred, target, reduction="none")
+        if self.config.do_mask_loss_for_padding:
+            if "action_is_pad" not in batch:
+                raise ValueError(
+                    "You need to provide 'action_is_pad' in the batch when "
+                    f"{self.config.do_mask_loss_for_padding=}."
+                )
+            in_episode_bound = ~batch["action_is_pad"]
+            policy_loss = policy_loss * in_episode_bound.unsqueeze(-1)
+        return policy_loss.mean()
+
+    def compute_loss_and_metrics(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """
         This function expects `batch` to have (at least):
         {
@@ -534,65 +719,60 @@ class DiffusionModel(nn.Module):
                 AND/OR
             "observation.environment_state": (B, n_obs_steps, environment_dim)
 
-            "action": (B, horizon, action_dim)
-            "action_is_pad": (B, horizon)
+            "action": (B, horizon, action_dim)                  # required in joint stage
+            "action_is_pad": (B, horizon)                       # required in joint stage if masking is enabled
         }
         """
-        # Input validation.
-        assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
+        assert OBS_STATE in batch
         assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
         n_obs_steps = batch[OBS_STATE].shape[1]
-        horizon = batch[ACTION].shape[1]
-        assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
 
-        # Encode image features and concatenate them all together along with the state vector.
-        global_cond, global_cond_mid = self._prepare_unet_conditioning(batch)
-
-        # Forward diffusion.
-        trajectory = batch[ACTION]
-        # Sample noise to add to the trajectory.
-        eps = torch.randn(trajectory.shape, device=trajectory.device)
-        # Sample a random noising timestep for each item in the batch.
-        timesteps = torch.randint(
-            low=0,
-            high=self.noise_scheduler.config.num_train_timesteps,
-            size=(trajectory.shape[0],),
-            device=trajectory.device,
-        ).long()
-        # Add noise to the clean trajectories according to the noise magnitude at each timestep.
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
-
-        # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        pred = self.unet(
-            noisy_trajectory,
-            timesteps,
-            global_cond=global_cond,
-            global_cond_mid=global_cond_mid,
-        )
-
-        # Compute the loss.
-        # The target is either the original trajectory, or the noise.
-        if self.config.prediction_type == "epsilon":
-            target = eps
-        elif self.config.prediction_type == "sample":
-            target = batch[ACTION]
+        policy_loss = None
+        if self.config.future_training_stage == "pretrain":
+            # Stage-1 pretraining only needs encoder features for future supervision.
+            obs_step_features = self._extract_obs_step_features(batch)
         else:
-            raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
+            global_cond, global_cond_mid, obs_step_features = self._prepare_unet_conditioning_and_aux(batch)
+            assert ACTION in batch
+            horizon = batch[ACTION].shape[1]
+            assert horizon == self.config.horizon
+            policy_loss = self._compute_policy_loss(batch, global_cond=global_cond, global_cond_mid=global_cond_mid)
 
-        loss = F.mse_loss(pred, target, reduction="none")
+        future_loss = None
+        future_metrics: dict[str, float] = {}
+        if self.config.enable_future_predictor and self.config.lambda_future > 0:
+            future_loss, future_metrics = self._compute_future_loss(obs_step_features)
 
-        # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
-        if self.config.do_mask_loss_for_padding:
-            if "action_is_pad" not in batch:
+        if self.config.future_training_stage == "pretrain":
+            if future_loss is None:
                 raise ValueError(
-                    "You need to provide 'action_is_pad' in the batch when "
-                    f"{self.config.do_mask_loss_for_padding=}."
+                    "Future pretrain stage requires future predictor enabled with `lambda_future > 0`."
                 )
-            in_episode_bound = ~batch["action_is_pad"]
-            loss = loss * in_episode_bound.unsqueeze(-1)
+            total_loss = self.config.lambda_future * future_loss
+            policy_loss_for_log = 0.0
+        else:
+            if policy_loss is None:
+                raise ValueError("Policy loss is required outside future pretrain stage.")
+            total_loss = policy_loss
+            policy_loss_for_log = float(policy_loss.detach().item())
+            if future_loss is not None:
+                total_loss = total_loss + self.config.lambda_future * future_loss
 
-        return loss.mean()
+        future_loss_for_log = 0.0 if future_loss is None else float(future_loss.detach().item())
+        metrics = {
+            "policy_loss": policy_loss_for_log,
+            "future_loss": future_loss_for_log,
+            "total_loss": float(total_loss.detach().item()),
+            "lambda_future": float(self.config.lambda_future),
+            "future_stage": self.config.future_training_stage,
+            **future_metrics,
+        }
+        return total_loss, metrics
+
+    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+        total_loss, _ = self.compute_loss_and_metrics(batch)
+        return total_loss
 
 
 class SpatialSoftmax(nn.Module):
