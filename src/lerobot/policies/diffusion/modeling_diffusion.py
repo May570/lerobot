@@ -167,7 +167,7 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
 class DiffusionModel(nn.Module):
     @staticmethod
     def _kalman_feature_dim(mode: str) -> int:
-        dims = {"full10": 10, "posvel6": 6, "vel3": 3, "velpred6": 6}
+        dims = {"full10": 10, "posvel6": 6, "vel3": 3, "velpred6": 6, "pred3": 3}
         if mode not in dims:
             raise ValueError(f"Unsupported kalman_feature_mode: {mode}")
         return dims[mode]
@@ -378,6 +378,7 @@ class DiffusionModel(nn.Module):
           - posvel6: [pos(3), vel(3)]
           - vel3: [vel(3)]
           - velpred6: [vel(3), pred_exec(3)]
+          - pred3: [pred_exec(3)]
         """
         state_obs = batch[OBS_STATE]
         b, s, _ = state_obs.shape
@@ -487,6 +488,12 @@ class DiffusionModel(nn.Module):
                 )
                 x_exec = torch.bmm(f_exec, x.unsqueeze(-1)).squeeze(-1)
                 out[:, si, 3:6] = x_exec[:, :3]
+            elif mode == "pred3":
+                f_exec, _ = _make_f_q(
+                    torch.full((b,), float(self.config.kalman_predict_horizon), device=device, dtype=dtype)
+                )
+                x_exec = torch.bmm(f_exec, x.unsqueeze(-1)).squeeze(-1)
+                out[:, si, :3] = x_exec[:, :3]
             else:
                 raise ValueError(f"Unsupported kalman_feature_mode: {mode}")
 

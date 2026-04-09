@@ -135,6 +135,25 @@ def test_kalman_velpred6_direct_concat_to_global_condition():
     assert torch.allclose(global_cond_steps[..., -6:], kalman, atol=1e-6)
 
 
+
+
+def test_kalman_pred3_direct_concat_to_global_condition():
+    cfg = _make_config(kalman_feature_mode="pred3")
+    policy = DiffusionPolicy(cfg)
+    model = policy.diffusion
+
+    batch = _make_batch(cfg.n_obs_steps)
+    kalman = model._compute_online_kalman_from_state(batch)
+
+    assert kalman.shape == (2, cfg.n_obs_steps, 3)
+    # pred_exec should respond for moving sample.
+    assert torch.count_nonzero(kalman[0, 1, :]).item() > 0
+
+    global_cond = model._prepare_global_conditioning(batch)
+    global_cond_steps = global_cond.view(batch[OBS_STATE].shape[0], cfg.n_obs_steps, -1)
+    assert torch.allclose(global_cond_steps[..., -3:], kalman, atol=1e-6)
+
+
 def test_kalman_feature_mlp_enabled_applies_before_concat():
     cfg = _make_config(kalman_feature_mode="vel3", enable_kalman_feature_mlp=True)
     policy = DiffusionPolicy(cfg)

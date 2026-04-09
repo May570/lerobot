@@ -77,6 +77,7 @@ class DiffusionConfig(PreTrainedConfig):
             - "posvel6": [pos(3), vel(3)]
             - "vel3": [vel(3)]
             - "velpred6": [vel(3), pred_exec(3)]
+            - "pred3": [pred_exec(3)]
         enable_kalman_feature_mlp: Whether to apply an MLP to Kalman features before concatenating
             into global conditioning.
         kalman_feature_mlp_dim: Output width of the optional Kalman MLP branch. If None, keep
@@ -221,9 +222,9 @@ class DiffusionConfig(PreTrainedConfig):
                 f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
                 f"Got {self.noise_scheduler_type}."
             )
-        if self.kalman_feature_mode not in {"full10", "posvel6", "vel3", "velpred6"}:
+        if self.kalman_feature_mode not in {"full10", "posvel6", "vel3", "velpred6", "pred3"}:
             raise ValueError(
-                "`kalman_feature_mode` must be one of {'full10', 'posvel6', 'vel3', 'velpred6'}. "
+                "`kalman_feature_mode` must be one of {'full10', 'posvel6', 'vel3', 'velpred6', 'pred3'}. "
                 f"Got {self.kalman_feature_mode}."
             )
         if self.kalman_feature_mlp_dim is not None and self.kalman_feature_mlp_dim <= 0:
