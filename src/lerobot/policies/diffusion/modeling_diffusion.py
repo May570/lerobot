@@ -180,6 +180,15 @@ class DiffusionModel(nn.Module):
         self._kalman_cond_dim = 0
         self.kalman_feature_mlp: nn.Module | None = None
         self.kalman_feature_gate: nn.Module | None = None
+        self._future_mode = self.config.model
+        self._use_future_robot_state = self._future_mode in {"robot_only", "robot_scene"}
+        self._use_future_ball_pos = self._future_mode in {"scene_only", "robot_scene"}
+        self._future_state_cond_dim = 0
+        self._future_ball_pos_in_dim = 0
+        self._future_ball_pos_cond_dim = 0
+        self.future_state_gate: nn.Module | None = None
+        self.future_ball_pos_mlp: nn.Module | None = None
+        self.future_ball_pos_gate: nn.Module | None = None
 
         # Build observation encoders (depending on which observations are provided).
         non_kalman_global_cond_dim = self.config.robot_state_feature.shape[0]
@@ -215,17 +224,45 @@ class DiffusionModel(nn.Module):
                     nn.Linear(self._kalman_cond_dim, self._kalman_cond_dim),
                     nn.Sigmoid(),
                 )
+        future_cond_dim = 0
+        if self._use_future_robot_state:
+            self._future_state_cond_dim = self.config.robot_state_feature.shape[0]
+            future_cond_dim += self._future_state_cond_dim
+            self.future_state_gate = nn.Sequential(
+                nn.Linear(self._future_state_cond_dim, self._future_state_cond_dim),
+                nn.Sigmoid(),
+            )
+        if self._use_future_ball_pos:
+            if self.config.input_features is None or self.config.future_ball_pos_key not in self.config.input_features:
+                raise ValueError(
+                    f"Missing required input feature `{self.config.future_ball_pos_key}` for {self._future_mode}."
+                )
+            self._future_ball_pos_in_dim = math.prod(self.config.input_features[self.config.future_ball_pos_key].shape)
+            self._future_ball_pos_cond_dim = self.config.future_ball_pos_mlp_dim
+            future_cond_dim += self._future_ball_pos_cond_dim
+            self.future_ball_pos_mlp = nn.Sequential(
+                nn.Linear(self._future_ball_pos_in_dim, self._future_ball_pos_cond_dim),
+                nn.SiLU(),
+                nn.Linear(self._future_ball_pos_cond_dim, self._future_ball_pos_cond_dim),
+            )
+            self.future_ball_pos_gate = nn.Sequential(
+                nn.Linear(self._future_ball_pos_cond_dim, self._future_ball_pos_cond_dim),
+                nn.Sigmoid(),
+            )
+
         full_global_cond_dim = non_kalman_global_cond_dim + kalman_cond_dim
+        non_kalman_global_cond_dim_flat = non_kalman_global_cond_dim * config.n_obs_steps + future_cond_dim
+        full_global_cond_dim_flat = full_global_cond_dim * config.n_obs_steps + future_cond_dim
         if self.config.enable_kalman_condition and self.config.enable_kalman_mid_only_condition:
             self.unet = DiffusionConditionalUnet1d(
                 config,
-                global_cond_dim=non_kalman_global_cond_dim * config.n_obs_steps,
-                global_cond_mid_dim=full_global_cond_dim * config.n_obs_steps,
+                global_cond_dim=non_kalman_global_cond_dim_flat,
+                global_cond_mid_dim=full_global_cond_dim_flat,
             )
         else:
             self.unet = DiffusionConditionalUnet1d(
                 config,
-                global_cond_dim=full_global_cond_dim * config.n_obs_steps,
+                global_cond_dim=full_global_cond_dim_flat,
             )
 
         if config.compile_model:
@@ -257,6 +294,84 @@ class DiffusionModel(nn.Module):
         start = int(parts[0]) if parts[0] else None
         end = int(parts[1]) if parts[1] else None
         return slice(start, end)
+
+    def _split_state_sequence(self, state_obs: Tensor) -> tuple[Tensor, Tensor | None]:
+        if state_obs.ndim != 3:
+            raise ValueError(f"`{OBS_STATE}` must have shape (B, S, D). Got {tuple(state_obs.shape)}.")
+        if state_obs.shape[1] < self.config.n_obs_steps:
+            raise ValueError(
+                f"`{OBS_STATE}` must contain at least {self.config.n_obs_steps} steps. "
+                f"Got shape {tuple(state_obs.shape)}."
+            )
+
+        state_history = state_obs[:, : self.config.n_obs_steps]
+        future_state = None
+        if self._use_future_robot_state and state_obs.shape[1] > self.config.n_obs_steps:
+            future_state = state_obs[:, self.config.n_obs_steps]
+        return state_history, future_state
+
+    def _prepare_future_conditioning(
+        self,
+        batch: dict[str, Tensor],
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        future_state_obs: Tensor | None,
+    ) -> Tensor | None:
+        future_parts: list[Tensor] = []
+
+        if self._use_future_robot_state:
+            if self.future_state_gate is None:
+                raise RuntimeError("future_state_gate is not initialized.")
+            state_cond = (
+                future_state_obs.reshape(batch_size, -1).to(device=device, dtype=dtype)
+                if future_state_obs is not None
+                else torch.zeros((batch_size, self._future_state_cond_dim), device=device, dtype=dtype)
+            )
+            if state_cond.shape[-1] != self._future_state_cond_dim:
+                raise ValueError(
+                    f"Future state dim mismatch. Expected {self._future_state_cond_dim}, got {state_cond.shape[-1]}."
+                )
+            state_cond = state_cond * self.future_state_gate(state_cond)
+            future_parts.append(state_cond)
+
+        if self._use_future_ball_pos:
+            if self.future_ball_pos_mlp is None or self.future_ball_pos_gate is None:
+                raise RuntimeError("future_ball_pos_mlp/future_ball_pos_gate are not initialized.")
+
+            ball_future: Tensor | None = None
+            if self.config.future_ball_pos_key in batch:
+                ball_obs = batch[self.config.future_ball_pos_key]
+                if ball_obs.ndim == 2:
+                    ball_obs = ball_obs.unsqueeze(1)
+                if ball_obs.ndim < 3:
+                    raise ValueError(
+                        f"`{self.config.future_ball_pos_key}` must have shape (B, S, D). "
+                        f"Got {tuple(ball_obs.shape)}."
+                    )
+                if ball_obs.shape[1] > 0:
+                    ball_future = ball_obs[:, -1].reshape(batch_size, -1).to(device=device, dtype=dtype)
+                    if ball_future.shape[-1] != self._future_ball_pos_in_dim:
+                        raise ValueError(
+                            "Future ball_pos dim mismatch. "
+                            f"Expected {self._future_ball_pos_in_dim}, got {ball_future.shape[-1]}."
+                        )
+
+            if ball_future is None:
+                ball_cond = torch.zeros(
+                    (batch_size, self._future_ball_pos_cond_dim),
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                ball_cond = self.future_ball_pos_mlp(ball_future)
+                ball_cond = ball_cond * self.future_ball_pos_gate(ball_cond)
+
+            future_parts.append(ball_cond)
+
+        if not future_parts:
+            return None
+        return torch.cat(future_parts, dim=-1)
 
     # ========= inference  ============
     def conditional_sample(
@@ -306,13 +421,16 @@ class DiffusionModel(nn.Module):
             - default path: (full_cond, None)
             - kalman mid-only path: (non_kalman_cond, full_cond)
         """
-        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        non_kalman_feats = [batch[OBS_STATE]]
+        state_obs, future_state_obs = self._split_state_sequence(batch[OBS_STATE])
+        batch_size, n_obs_steps = state_obs.shape[:2]
+        non_kalman_feats = [state_obs]
+
         # Extract image features.
         if self.config.image_features:
+            obs_images = batch[OBS_IMAGES][:, :n_obs_steps]
             if self.config.use_separate_rgb_encoder_per_camera:
                 # Combine batch and sequence dims while rearranging to make the camera index dimension first.
-                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
+                images_per_camera = einops.rearrange(obs_images, "b s n ... -> n (b s) ...")
                 img_features_list = torch.cat(
                     [
                         encoder(images)
@@ -327,7 +445,7 @@ class DiffusionModel(nn.Module):
             else:
                 # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
                 img_features = self.rgb_encoder(
-                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+                    einops.rearrange(obs_images, "b s n ... -> (b s n) ...")
                 )
                 # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
                 # feature dim (effectively concatenating the camera features).
@@ -347,20 +465,38 @@ class DiffusionModel(nn.Module):
             if self.config.kalman_force_zero_global_condition:
                 kalman_features = torch.zeros(
                     (batch_size, n_obs_steps, self._kalman_cond_dim),
-                    device=batch[OBS_STATE].device,
-                    dtype=batch[OBS_STATE].dtype,
+                    device=state_obs.device,
+                    dtype=state_obs.dtype,
                 )
 
         if self.config.env_state_feature:
-            non_kalman_feats.append(batch[OBS_ENV_STATE])
+            env_state_obs = batch[OBS_ENV_STATE]
+            if env_state_obs.shape[1] < n_obs_steps:
+                raise ValueError(
+                    f"`{OBS_ENV_STATE}` must contain at least {n_obs_steps} steps. "
+                    f"Got shape {tuple(env_state_obs.shape)}."
+                )
+            non_kalman_feats.append(env_state_obs[:, :n_obs_steps])
+
+        future_cond = self._prepare_future_conditioning(
+            batch=batch,
+            batch_size=batch_size,
+            dtype=state_obs.dtype,
+            device=state_obs.device,
+            future_state_obs=future_state_obs,
+        )
 
         non_kalman_cond = torch.cat(non_kalman_feats, dim=-1).flatten(start_dim=1)
+        if future_cond is not None:
+            non_kalman_cond = torch.cat([non_kalman_cond, future_cond], dim=-1)
         if kalman_features is None:
             return non_kalman_cond, None
 
         full_cond = torch.cat([torch.cat(non_kalman_feats, dim=-1), kalman_features], dim=-1).flatten(
             start_dim=1
         )
+        if future_cond is not None:
+            full_cond = torch.cat([full_cond, future_cond], dim=-1)
         if self.config.enable_kalman_mid_only_condition:
             return non_kalman_cond, full_cond
         return full_cond, None
@@ -380,7 +516,7 @@ class DiffusionModel(nn.Module):
           - velpred6: [vel(3), pred_exec(3)]
           - pred3: [pred_exec(3)]
         """
-        state_obs = batch[OBS_STATE]
+        state_obs, _ = self._split_state_sequence(batch[OBS_STATE])
         b, s, _ = state_obs.shape
         z = state_obs[..., self._kalman_pos_slice]
         if z.shape[-1] != 3:
@@ -510,8 +646,8 @@ class DiffusionModel(nn.Module):
             "observation.environment_state": (B, n_obs_steps, environment_dim)
         }
         """
-        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        assert n_obs_steps == self.config.n_obs_steps
+        batch_size = batch[OBS_STATE].shape[0]
+        assert batch[OBS_STATE].shape[1] >= self.config.n_obs_steps
 
         # Encode image features and concatenate them all together along with the state vector.
         global_cond, global_cond_mid = self._prepare_unet_conditioning(batch)
@@ -525,7 +661,7 @@ class DiffusionModel(nn.Module):
         )
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
-        start = n_obs_steps - 1
+        start = self.config.n_obs_steps - 1
         end = start + self.config.n_action_steps
         actions = actions[:, start:end]
 
@@ -548,10 +684,9 @@ class DiffusionModel(nn.Module):
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
         assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
-        n_obs_steps = batch[OBS_STATE].shape[1]
         horizon = batch[ACTION].shape[1]
         assert horizon == self.config.horizon
-        assert n_obs_steps == self.config.n_obs_steps
+        assert batch[OBS_STATE].shape[1] >= self.config.n_obs_steps
 
         # Encode image features and concatenate them all together along with the state vector.
         global_cond, global_cond_mid = self._prepare_unet_conditioning(batch)

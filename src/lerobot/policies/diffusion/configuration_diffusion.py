@@ -17,9 +17,10 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import NormalizationMode
+from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
+from lerobot.utils.constants import OBS_STATE
 
 
 @PreTrainedConfig.register_subclass("diffusion")
@@ -71,6 +72,14 @@ class DiffusionConfig(PreTrainedConfig):
             The group sizes are set to be about 16 (to be precise, feature_dim // 16).
         spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
         use_separate_rgb_encoder_per_camera: Whether to use a separate RGB encoder for each camera view.
+        model: Diffusion conditioning mode.
+            - "orig": Original diffusion policy path.
+            - "robot_only": Adds a future robot state branch from t+2 through a learned gate.
+            - "scene_only": Adds a future ball_pos branch from t+2 through MLP(->8) + gate.
+            - "robot_scene": Adds both future robot state and future ball_pos branches.
+        future_condition_delta: Future frame offset (in steps) for future-conditioning branches.
+        future_ball_pos_key: Observation key used by scene branches for future ball position.
+        future_ball_pos_mlp_dim: Output width of the future ball_pos MLP branch before gating.
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
         kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
@@ -153,6 +162,10 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+    model: str = "orig"
+    future_condition_delta: int = 2
+    future_ball_pos_key: str = "observation.ball_pos"
+    future_ball_pos_mlp_dim: int = 8
     # Experimental: direct online Kalman conditioning branch.
     enable_kalman_condition: bool = False
     kalman_feature_mode: str = "full10"
@@ -221,6 +234,19 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
                 f"Got {self.noise_scheduler_type}."
+            )
+        if self.model not in {"orig", "robot_only", "scene_only", "robot_scene"}:
+            raise ValueError(
+                "`model` must be one of {'orig', 'robot_only', 'scene_only', 'robot_scene'}. "
+                f"Got {self.model}."
+            )
+        if self.future_condition_delta <= 0:
+            raise ValueError(
+                f"`future_condition_delta` must be > 0. Got {self.future_condition_delta}."
+            )
+        if self.future_ball_pos_mlp_dim <= 0:
+            raise ValueError(
+                f"`future_ball_pos_mlp_dim` must be > 0. Got {self.future_ball_pos_mlp_dim}."
             )
         if self.kalman_feature_mode not in {"full10", "posvel6", "vel3", "velpred6", "pred3"}:
             raise ValueError(
@@ -306,6 +332,21 @@ class DiffusionConfig(PreTrainedConfig):
         if len(self.image_features) == 0 and self.env_state_feature is None:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 
+        if self.model in {"scene_only", "robot_scene"}:
+            if self.input_features is None or self.future_ball_pos_key not in self.input_features:
+                raise ValueError(
+                    f"`model={self.model}` requires `{self.future_ball_pos_key}` in input_features."
+                )
+            ball_pos_feature = self.input_features[self.future_ball_pos_key]
+            if ball_pos_feature.type is not FeatureType.STATE:
+                raise ValueError(
+                    f"`{self.future_ball_pos_key}` must be a STATE feature. Got {ball_pos_feature.type}."
+                )
+            if len(ball_pos_feature.shape) != 1:
+                raise ValueError(
+                    f"`{self.future_ball_pos_key}` must be a 1D feature. Got shape {ball_pos_feature.shape}."
+                )
+
         if self.resize_shape is None and self.crop_shape is not None:
             for key, image_ft in self.image_features.items():
                 if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
@@ -326,6 +367,20 @@ class DiffusionConfig(PreTrainedConfig):
     @property
     def observation_delta_indices(self) -> list:
         return list(range(1 - self.n_obs_steps, 1))
+
+    @property
+    def observation_delta_indices_by_key(self) -> dict[str, list[int]] | None:
+        if self.model == "orig":
+            return None
+
+        by_key: dict[str, list[int]] = {}
+        base_obs = list(range(1 - self.n_obs_steps, 1))
+        if self.model in {"robot_only", "robot_scene"}:
+            by_key[OBS_STATE] = [*base_obs, self.future_condition_delta]
+        if self.model in {"scene_only", "robot_scene"}:
+            by_key[self.future_ball_pos_key] = [self.future_condition_delta]
+
+        return by_key if by_key else None
 
     @property
     def action_delta_indices(self) -> list:

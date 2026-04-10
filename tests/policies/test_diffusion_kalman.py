@@ -5,7 +5,7 @@ import torch
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
-from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
 def _make_config(
@@ -49,6 +49,45 @@ def _make_batch(n_obs_steps: int = 2) -> dict[str, torch.Tensor]:
         OBS_IMAGES: torch.zeros((state.shape[0], n_obs_steps, 1, 3, 32, 32), dtype=torch.float32),
         "timestamp": torch.tensor([[0.0, 0.1], [0.0, 0.1]], dtype=torch.float32),
     }
+
+
+def _make_future_mode_config(
+    *,
+    model: str,
+    include_ball_pos: bool = False,
+) -> DiffusionConfig:
+    input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+        OBS_ENV_STATE: PolicyFeature(type=FeatureType.ENV, shape=(4,)),
+    }
+    if include_ball_pos:
+        input_features["observation.ball_pos"] = PolicyFeature(type=FeatureType.STATE, shape=(3,))
+
+    return DiffusionConfig(
+        input_features=input_features,
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+        device="cpu",
+        model=model,
+        enable_kalman_condition=False,
+        down_dims=(64, 128),
+    )
+
+
+def _make_future_mode_batch(
+    *,
+    include_future_state: bool,
+    include_ball_pos: bool,
+) -> dict[str, torch.Tensor]:
+    state_steps = 3 if include_future_state else 2
+    batch = {
+        OBS_STATE: torch.arange(2 * state_steps * 8, dtype=torch.float32).view(2, state_steps, 8),
+        OBS_ENV_STATE: torch.arange(2 * 2 * 4, dtype=torch.float32).view(2, 2, 4) / 10.0,
+    }
+    if include_ball_pos:
+        batch["observation.ball_pos"] = torch.tensor(
+            [[[0.1, 0.2, 0.3]], [[0.4, 0.5, 0.6]]], dtype=torch.float32
+        )
+    return batch
 
 
 def test_kalman_posvel6_direct_concat_to_global_condition():
@@ -241,3 +280,73 @@ def test_kalman_force_zero_overrides_mlp_and_gate():
     global_cond_steps = global_cond.view(batch[OBS_STATE].shape[0], cfg.n_obs_steps, -1)
 
     assert torch.count_nonzero(global_cond_steps[..., -3:]).item() == 0
+
+
+def test_future_mode_observation_delta_indices_by_key():
+    cfg = _make_future_mode_config(model="robot_scene", include_ball_pos=True)
+    assert cfg.observation_delta_indices_by_key == {
+        OBS_STATE: [-1, 0, 2],
+        "observation.ball_pos": [2],
+    }
+
+
+def test_robot_only_future_state_gate_is_appended_to_global_condition():
+    cfg_orig = _make_future_mode_config(model="orig")
+    policy_orig = DiffusionPolicy(cfg_orig)
+    model_orig = policy_orig.diffusion
+
+    cfg_robot = _make_future_mode_config(model="robot_only")
+    policy_robot = DiffusionPolicy(cfg_robot)
+    model_robot = policy_robot.diffusion
+
+    batch_robot = _make_future_mode_batch(include_future_state=True, include_ball_pos=False)
+    batch_orig = {
+        OBS_STATE: batch_robot[OBS_STATE][:, :2],
+        OBS_ENV_STATE: batch_robot[OBS_ENV_STATE],
+    }
+
+    cond_orig = model_orig._prepare_global_conditioning(batch_orig)
+    cond_robot = model_robot._prepare_global_conditioning(batch_robot)
+
+    future_state = batch_robot[OBS_STATE][:, 2]
+    expected_future = future_state * model_robot.future_state_gate(future_state)
+    assert torch.allclose(cond_robot[:, : cond_orig.shape[-1]], cond_orig, atol=1e-6)
+    assert torch.allclose(cond_robot[:, -8:], expected_future, atol=1e-6)
+
+
+def test_scene_only_future_ball_pos_uses_mlp_and_gate():
+    cfg_orig = _make_future_mode_config(model="orig")
+    policy_orig = DiffusionPolicy(cfg_orig)
+    model_orig = policy_orig.diffusion
+
+    cfg_scene = _make_future_mode_config(model="scene_only", include_ball_pos=True)
+    policy_scene = DiffusionPolicy(cfg_scene)
+    model_scene = policy_scene.diffusion
+
+    batch_orig = _make_future_mode_batch(include_future_state=False, include_ball_pos=False)
+    batch_scene = _make_future_mode_batch(include_future_state=False, include_ball_pos=True)
+
+    cond_orig = model_orig._prepare_global_conditioning(batch_orig)
+    cond_scene = model_scene._prepare_global_conditioning(batch_scene)
+
+    ball_pos = batch_scene["observation.ball_pos"][:, -1]
+    expected_scene = model_scene.future_ball_pos_mlp(ball_pos)
+    expected_scene = expected_scene * model_scene.future_ball_pos_gate(expected_scene)
+    assert torch.allclose(cond_scene[:, : cond_orig.shape[-1]], cond_orig, atol=1e-6)
+    assert torch.allclose(cond_scene[:, -8:], expected_scene, atol=1e-6)
+
+
+def test_robot_scene_appends_robot_and_scene_future_conditions():
+    cfg = _make_future_mode_config(model="robot_scene", include_ball_pos=True)
+    policy = DiffusionPolicy(cfg)
+    model = policy.diffusion
+    batch = _make_future_mode_batch(include_future_state=True, include_ball_pos=True)
+
+    cond = model._prepare_global_conditioning(batch)
+    future_state = batch[OBS_STATE][:, 2]
+    expected_robot = future_state * model.future_state_gate(future_state)
+    ball_pos = batch["observation.ball_pos"][:, -1]
+    expected_scene = model.future_ball_pos_mlp(ball_pos)
+    expected_scene = expected_scene * model.future_ball_pos_gate(expected_scene)
+    expected = torch.cat([expected_robot, expected_scene], dim=-1)
+    assert torch.allclose(cond[:, -16:], expected, atol=1e-6)
