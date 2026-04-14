@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import pytest
 import torch
 
 from lerobot.configs.types import FeatureType, PolicyFeature
@@ -55,6 +56,10 @@ def _make_future_mode_config(
     *,
     model: str,
     include_ball_pos: bool = False,
+    delay_random: bool = False,
+    delay_random_deltas: tuple[int, ...] = (2, 3, 4, 5, 6),
+    delay_random_probs: tuple[float, ...] = (0.08, 0.17, 0.29, 0.29, 0.17),
+    future_condition_delta: int = 2,
 ) -> DiffusionConfig:
     input_features = {
         OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
@@ -68,6 +73,10 @@ def _make_future_mode_config(
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
         device="cpu",
         model=model,
+        delay_random=delay_random,
+        delay_random_deltas=delay_random_deltas,
+        delay_random_probs=delay_random_probs,
+        future_condition_delta=future_condition_delta,
         enable_kalman_condition=False,
         down_dims=(64, 128),
     )
@@ -290,6 +299,14 @@ def test_future_mode_observation_delta_indices_by_key():
     }
 
 
+def test_delay_random_observation_delta_indices_by_key():
+    cfg = _make_future_mode_config(model="robot_scene", include_ball_pos=True, delay_random=True)
+    assert cfg.observation_delta_indices_by_key == {
+        OBS_STATE: [-1, 0, 2, 3, 4, 5, 6],
+        "observation.ball_pos": [2, 3, 4, 5, 6],
+    }
+
+
 def test_robot_only_future_state_gate_is_appended_to_global_condition():
     cfg_orig = _make_future_mode_config(model="orig")
     policy_orig = DiffusionPolicy(cfg_orig)
@@ -350,3 +367,111 @@ def test_robot_scene_appends_robot_and_scene_future_conditions():
     expected_scene = expected_scene * model.future_ball_pos_gate(expected_scene)
     expected = torch.cat([expected_robot, expected_scene], dim=-1)
     assert torch.allclose(cond[:, -16:], expected, atol=1e-6)
+
+
+def test_robot_only_online_history_uses_kalman_predicted_future_state():
+    cfg = _make_future_mode_config(model="robot_only")
+    policy = DiffusionPolicy(cfg)
+    model = policy.diffusion
+
+    batch = _make_future_mode_batch(include_future_state=False, include_ball_pos=False)
+    batch["timestamp"] = torch.tensor([[0.0, 0.1], [0.0, 0.1]], dtype=torch.float32)
+
+    cond = model._prepare_global_conditioning(batch)
+    predicted_future = model._predict_future_observation_with_kalman(batch[OBS_STATE], batch)
+    expected_future = predicted_future * model.future_state_gate(predicted_future)
+    assert torch.allclose(cond[:, -8:], expected_future, atol=1e-6)
+
+
+def test_scene_only_online_history_uses_kalman_predicted_ball_pos():
+    cfg = _make_future_mode_config(model="scene_only", include_ball_pos=True)
+    policy = DiffusionPolicy(cfg)
+    model = policy.diffusion
+    model.eval()
+
+    batch = _make_future_mode_batch(include_future_state=False, include_ball_pos=False)
+    batch["observation.ball_pos"] = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]],
+            [[0.5, -0.5, 1.0], [1.0, 0.0, 1.5]],
+        ],
+        dtype=torch.float32,
+    )
+    batch["timestamp"] = torch.tensor([[0.0, 0.1], [0.0, 0.1]], dtype=torch.float32)
+
+    cond = model._prepare_global_conditioning(batch)
+    predicted_ball = model._predict_future_observation_with_kalman(batch["observation.ball_pos"], batch)
+    expected_scene = model.future_ball_pos_mlp(predicted_ball)
+    expected_scene = expected_scene * model.future_ball_pos_gate(expected_scene)
+    assert torch.allclose(cond[:, -8:], expected_scene, atol=1e-6)
+
+
+def test_delay_random_training_samples_future_delta_and_eval_uses_fixed_delta():
+    cfg = _make_future_mode_config(
+        model="robot_scene",
+        include_ball_pos=True,
+        delay_random=True,
+        future_condition_delta=2,
+        delay_random_deltas=(2, 3, 4, 5, 6),
+        # Always choose delta=5 (index=3) during training for deterministic assertions.
+        delay_random_probs=(0.0, 0.0, 0.0, 1.0, 0.0),
+    )
+    policy = DiffusionPolicy(cfg)
+    model = policy.diffusion
+
+    state_history = torch.tensor(
+        [
+            [[0.0] * 8, [1.0] * 8],
+            [[2.0] * 8, [3.0] * 8],
+        ],
+        dtype=torch.float32,
+    )
+    state_future_candidates = torch.tensor(
+        [
+            [[10.0] * 8, [20.0] * 8, [30.0] * 8, [40.0] * 8, [50.0] * 8],
+            [[11.0] * 8, [21.0] * 8, [31.0] * 8, [41.0] * 8, [51.0] * 8],
+        ],
+        dtype=torch.float32,
+    )
+    ball_future_candidates = torch.tensor(
+        [
+            [[0.2, 0.2, 0.2], [0.3, 0.3, 0.3], [0.4, 0.4, 0.4], [0.5, 0.5, 0.5], [0.6, 0.6, 0.6]],
+            [[0.7, 0.7, 0.7], [0.8, 0.8, 0.8], [0.9, 0.9, 0.9], [1.0, 1.0, 1.0], [1.1, 1.1, 1.1]],
+        ],
+        dtype=torch.float32,
+    )
+    batch = {
+        OBS_STATE: torch.cat([state_history, state_future_candidates], dim=1),
+        OBS_ENV_STATE: torch.zeros((2, 2, 4), dtype=torch.float32),
+        "observation.ball_pos": ball_future_candidates,
+    }
+
+    # Training mode: choose delta=5 (candidate index 3).
+    model.train()
+    cond_train = model._prepare_global_conditioning(batch)
+    expected_train_robot = state_future_candidates[:, 3] * model.future_state_gate(state_future_candidates[:, 3])
+    expected_train_scene = model.future_ball_pos_mlp(ball_future_candidates[:, 3])
+    expected_train_scene = expected_train_scene * model.future_ball_pos_gate(expected_train_scene)
+    expected_train = torch.cat([expected_train_robot, expected_train_scene], dim=-1)
+    assert torch.allclose(cond_train[:, -16:], expected_train, atol=1e-6)
+
+    # Eval mode: use fixed future_condition_delta=2 (candidate index 0).
+    model.eval()
+    cond_eval = model._prepare_global_conditioning(batch)
+    expected_eval_robot = state_future_candidates[:, 0] * model.future_state_gate(state_future_candidates[:, 0])
+    expected_eval_scene = model.future_ball_pos_mlp(ball_future_candidates[:, 0])
+    expected_eval_scene = expected_eval_scene * model.future_ball_pos_gate(expected_eval_scene)
+    expected_eval = torch.cat([expected_eval_robot, expected_eval_scene], dim=-1)
+    assert torch.allclose(cond_eval[:, -16:], expected_eval, atol=1e-6)
+
+
+def test_training_raises_when_scene_branch_missing_dataset_ball_pos():
+    cfg = _make_future_mode_config(model="scene_only", include_ball_pos=True)
+    policy = DiffusionPolicy(cfg)
+    model = policy.diffusion
+    model.train()
+
+    batch = _make_future_mode_batch(include_future_state=False, include_ball_pos=False)
+
+    with pytest.raises(ValueError, match="Missing required dataset feature for training"):
+        model._prepare_global_conditioning(batch)

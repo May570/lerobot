@@ -78,6 +78,11 @@ class DiffusionConfig(PreTrainedConfig):
             - "scene_only": Adds a future ball_pos branch from t+2 through MLP(->8) + gate.
             - "robot_scene": Adds both future robot state and future ball_pos branches.
         future_condition_delta: Future frame offset (in steps) for future-conditioning branches.
+        delay_random: Whether to randomize the future delay during training for non-`orig` modes.
+            When enabled, future delay is sampled from `delay_random_deltas` with
+            probabilities `delay_random_probs`.
+        delay_random_deltas: Candidate future delays used when `delay_random=True`.
+        delay_random_probs: Sampling probabilities aligned with `delay_random_deltas`.
         future_ball_pos_key: Observation key used by scene branches for future ball position.
         future_ball_pos_mlp_dim: Output width of the future ball_pos MLP branch before gating.
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
@@ -164,6 +169,9 @@ class DiffusionConfig(PreTrainedConfig):
     use_separate_rgb_encoder_per_camera: bool = False
     model: str = "orig"
     future_condition_delta: int = 2
+    delay_random: bool = False
+    delay_random_deltas: tuple[int, ...] = (2, 3, 4, 5, 6)
+    delay_random_probs: tuple[float, ...] = (0.08, 0.17, 0.29, 0.29, 0.17)
     future_ball_pos_key: str = "observation.ball_pos"
     future_ball_pos_mlp_dim: int = 8
     # Experimental: direct online Kalman conditioning branch.
@@ -243,6 +251,27 @@ class DiffusionConfig(PreTrainedConfig):
         if self.future_condition_delta <= 0:
             raise ValueError(
                 f"`future_condition_delta` must be > 0. Got {self.future_condition_delta}."
+            )
+        if len(self.delay_random_deltas) == 0:
+            raise ValueError("`delay_random_deltas` must not be empty.")
+        if any(delta <= 0 for delta in self.delay_random_deltas):
+            raise ValueError(f"`delay_random_deltas` must contain positive integers. Got {self.delay_random_deltas}.")
+        if len(set(self.delay_random_deltas)) != len(self.delay_random_deltas):
+            raise ValueError(f"`delay_random_deltas` must not contain duplicates. Got {self.delay_random_deltas}.")
+        if len(self.delay_random_probs) != len(self.delay_random_deltas):
+            raise ValueError(
+                "`delay_random_probs` must have the same length as `delay_random_deltas`. "
+                f"Got {len(self.delay_random_probs)} vs {len(self.delay_random_deltas)}."
+            )
+        if any(prob < 0 for prob in self.delay_random_probs):
+            raise ValueError(f"`delay_random_probs` must be non-negative. Got {self.delay_random_probs}.")
+        if sum(self.delay_random_probs) <= 0:
+            raise ValueError(f"`delay_random_probs` must sum to > 0. Got {self.delay_random_probs}.")
+        if self.delay_random and self.model != "orig" and self.future_condition_delta not in self.delay_random_deltas:
+            raise ValueError(
+                "`future_condition_delta` must be included in `delay_random_deltas` when "
+                f"`delay_random=True` and model is non-orig. Got {self.future_condition_delta} "
+                f"not in {self.delay_random_deltas}."
             )
         if self.future_ball_pos_mlp_dim <= 0:
             raise ValueError(
@@ -369,16 +398,23 @@ class DiffusionConfig(PreTrainedConfig):
         return list(range(1 - self.n_obs_steps, 1))
 
     @property
+    def future_condition_deltas(self) -> list[int]:
+        if self.model != "orig" and self.delay_random:
+            return list(self.delay_random_deltas)
+        return [self.future_condition_delta]
+
+    @property
     def observation_delta_indices_by_key(self) -> dict[str, list[int]] | None:
         if self.model == "orig":
             return None
 
         by_key: dict[str, list[int]] = {}
         base_obs = list(range(1 - self.n_obs_steps, 1))
+        future_deltas = self.future_condition_deltas
         if self.model in {"robot_only", "robot_scene"}:
-            by_key[OBS_STATE] = [*base_obs, self.future_condition_delta]
+            by_key[OBS_STATE] = [*base_obs, *future_deltas]
         if self.model in {"scene_only", "robot_scene"}:
-            by_key[self.future_ball_pos_key] = [self.future_condition_delta]
+            by_key[self.future_ball_pos_key] = list(future_deltas)
 
         return by_key if by_key else None
 

@@ -100,6 +100,19 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
     if "robot_state" in observations:
         return_observations[f"{OBS_STR}.robot_state"] = _convert_nested_dict(observations["robot_state"])
 
+    # Optional simulator-provided ball position used by future scene conditioning.
+    # Accept both raw and already-prefixed key names.
+    ball_pos = None
+    if "ball_pos" in observations:
+        ball_pos = observations["ball_pos"]
+    elif "observation.ball_pos" in observations:
+        ball_pos = observations["observation.ball_pos"]
+    if ball_pos is not None:
+        ball_pos_tensor = torch.as_tensor(ball_pos, dtype=torch.float32)
+        if ball_pos_tensor.dim() == 1:
+            ball_pos_tensor = ball_pos_tensor.unsqueeze(0)
+        return_observations["observation.ball_pos"] = ball_pos_tensor
+
     # Handle IsaacLab Arena format: observations have 'policy' and 'camera_obs' keys
     if "policy" in observations:
         return_observations[f"{OBS_STR}.policy"] = observations["policy"]

@@ -89,6 +89,10 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.model in {"scene_only", "robot_scene"}:
+            self._queues[self.config.future_ball_pos_key] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.enable_kalman_condition or self.config.model != "orig":
+            self._queues["timestamp"] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -183,6 +187,16 @@ class DiffusionModel(nn.Module):
         self._future_mode = self.config.model
         self._use_future_robot_state = self._future_mode in {"robot_only", "robot_scene"}
         self._use_future_ball_pos = self._future_mode in {"scene_only", "robot_scene"}
+        self._future_delay_deltas = tuple(int(d) for d in self.config.future_condition_deltas)
+        self._future_delay_count = len(self._future_delay_deltas)
+        self._future_delay_index_by_delta = {delta: i for i, delta in enumerate(self._future_delay_deltas)}
+        self._delay_random_active = (
+            self.config.model != "orig" and self.config.delay_random and self._future_delay_count > 1
+        )
+        self._delay_random_probs = None
+        if self._delay_random_active:
+            probs = torch.tensor(self.config.delay_random_probs, dtype=torch.float32)
+            self._delay_random_probs = probs / probs.sum()
         self._future_state_cond_dim = 0
         self._future_ball_pos_in_dim = 0
         self._future_ball_pos_cond_dim = 0
@@ -295,6 +309,185 @@ class DiffusionModel(nn.Module):
         end = int(parts[1]) if parts[1] else None
         return slice(start, end)
 
+    def _resolve_kalman_dt(
+        self,
+        batch: dict[str, Tensor],
+        batch_size: int,
+        n_steps: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        dt = torch.full((batch_size, n_steps), float(self.config.kalman_dt_fallback), device=device, dtype=dtype)
+        if "timestamp" not in batch:
+            return dt
+
+        ts = batch["timestamp"]
+        if ts.ndim == 1:
+            ts = ts.unsqueeze(1)
+        elif ts.ndim >= 3 and ts.shape[-1] == 1:
+            ts = ts.squeeze(-1)
+        if ts.ndim < 2 or ts.shape[0] != batch_size or ts.shape[1] < n_steps:
+            return dt
+
+        ts = ts[:, :n_steps].to(device=device, dtype=dtype)
+        dt[:, 1:] = ts[:, 1:] - ts[:, :-1]
+        dt = torch.where(
+            (dt > 0) & torch.isfinite(dt),
+            dt,
+            torch.full_like(dt, float(self.config.kalman_dt_fallback)),
+        )
+        return dt
+
+    def _select_future_delay_indices(self, batch_size: int, device: torch.device) -> Tensor:
+        if self._delay_random_active and self.training:
+            if self._delay_random_probs is None:
+                raise RuntimeError("delay_random is enabled but delay_random_probs are not initialized.")
+            return torch.multinomial(self._delay_random_probs.to(device=device), batch_size, replacement=True)
+
+        fixed_delta = int(self.config.future_condition_delta)
+        fixed_idx = self._future_delay_index_by_delta.get(fixed_delta)
+        if fixed_idx is None:
+            raise ValueError(
+                "`future_condition_delta` is not present in active future delta candidates. "
+                f"Got {fixed_delta}, candidates: {self._future_delay_deltas}."
+            )
+        return torch.full((batch_size,), fixed_idx, device=device, dtype=torch.long)
+
+    def _future_delay_steps_from_indices(self, delay_indices: Tensor, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+        delay_values = torch.tensor(self._future_delay_deltas, device=device, dtype=dtype)
+        return delay_values[delay_indices]
+
+    def _select_future_from_explicit_sequence(
+        self,
+        future_obs: Tensor,
+        delay_indices: Tensor,
+        *,
+        branch_name: str,
+    ) -> Tensor:
+        if future_obs.ndim == 2:
+            return future_obs
+        if future_obs.ndim != 3:
+            raise ValueError(
+                f"Explicit future {branch_name} must have shape (B, S, D) or (B, D). Got {tuple(future_obs.shape)}."
+            )
+        if future_obs.shape[1] == 0:
+            raise ValueError(f"Explicit future {branch_name} has zero sequence length.")
+        if future_obs.shape[1] == 1:
+            return future_obs[:, 0]
+        if future_obs.shape[1] != self._future_delay_count:
+            raise ValueError(
+                f"Explicit future {branch_name} sequence length mismatch. "
+                f"Expected {self._future_delay_count} from deltas {self._future_delay_deltas}, "
+                f"got {future_obs.shape[1]}."
+            )
+        gather_idx = delay_indices.view(-1, 1, 1).expand(-1, 1, future_obs.shape[-1])
+        return future_obs.gather(1, gather_idx).squeeze(1)
+
+    def _predict_future_observation_with_kalman(
+        self,
+        obs_history: Tensor,
+        batch: dict[str, Tensor],
+        future_steps: Tensor | int | float | None = None,
+    ) -> Tensor:
+        """
+        Predict future observation at `future_condition_delta` steps ahead from history using
+        per-dimension constant-velocity Kalman filtering.
+
+        Args:
+            obs_history: (B, S, D) observation history (already normalized like policy inputs).
+            batch: Input batch, optionally containing `timestamp` with shape (B, S).
+        Returns:
+            Tensor with shape (B, D): predicted future observation.
+        """
+        if obs_history.ndim != 3:
+            raise ValueError(f"Expected obs history to have shape (B, S, D), got {tuple(obs_history.shape)}.")
+
+        b, s, d = obs_history.shape
+        device = obs_history.device
+        dtype = obs_history.dtype
+
+        valid = torch.isfinite(obs_history)
+        z = torch.nan_to_num(obs_history, nan=0.0, posinf=0.0, neginf=0.0)
+        dt = self._resolve_kalman_dt(batch, b, s, device=device, dtype=dtype)
+
+        # Flatten batch and feature dims so we can run one scalar Kalman per dimension.
+        n = b * d
+        x = torch.zeros((n, 2), device=device, dtype=dtype)
+        x[:, 0] = z[:, 0, :].reshape(-1)
+        p = torch.zeros((n, 2, 2), device=device, dtype=dtype)
+        p[:, 0, 0] = float(self.config.kalman_init_pos_std**2)
+        p[:, 1, 1] = float(self.config.kalman_init_vel_std**2)
+
+        sigma2 = float(self.config.kalman_accel_noise_std**2)
+        meas_var = float(self.config.kalman_meas_noise_std**2)
+        eps = torch.tensor(1e-12, device=device, dtype=dtype)
+
+        for si in range(s):
+            if si > 0:
+                step_dt = dt[:, si].unsqueeze(1).expand(b, d).reshape(-1)
+                dt2 = step_dt.square()
+                dt3 = dt2 * step_dt
+                dt4 = dt2.square()
+
+                x0, x1 = x[:, 0], x[:, 1]
+                x_pred0 = x0 + step_dt * x1
+                x_pred1 = x1
+                x = torch.stack([x_pred0, x_pred1], dim=-1)
+
+                p00, p01 = p[:, 0, 0], p[:, 0, 1]
+                p10, p11 = p[:, 1, 0], p[:, 1, 1]
+                p00_new = p00 + step_dt * (p10 + p01) + dt2 * p11 + (dt4 / 4.0) * sigma2
+                p01_new = p01 + step_dt * p11 + (dt3 / 2.0) * sigma2
+                p10_new = p10 + step_dt * p11 + (dt3 / 2.0) * sigma2
+                p11_new = p11 + dt2 * sigma2
+                p[:, 0, 0] = p00_new
+                p[:, 0, 1] = p01_new
+                p[:, 1, 0] = p10_new
+                p[:, 1, 1] = p11_new
+
+            z_si = z[:, si, :].reshape(-1)
+            valid_si = valid[:, si, :].reshape(-1)
+            if bool(valid_si.any()):
+                p00, p01 = p[:, 0, 0], p[:, 0, 1]
+                p10, p11 = p[:, 1, 0], p[:, 1, 1]
+                y = z_si - x[:, 0]
+                s_innov = torch.maximum(p00 + meas_var, eps)
+                k0 = p00 / s_innov
+                k1 = p10 / s_innov
+
+                x_upd0 = x[:, 0] + k0 * y
+                x_upd1 = x[:, 1] + k1 * y
+                p00_upd = (1.0 - k0) * p00
+                p01_upd = (1.0 - k0) * p01
+                p10_upd = p10 - k1 * p00
+                p11_upd = p11 - k1 * p01
+
+                x[:, 0] = torch.where(valid_si, x_upd0, x[:, 0])
+                x[:, 1] = torch.where(valid_si, x_upd1, x[:, 1])
+                p[:, 0, 0] = torch.where(valid_si, p00_upd, p[:, 0, 0])
+                p[:, 0, 1] = torch.where(valid_si, p01_upd, p[:, 0, 1])
+                p[:, 1, 0] = torch.where(valid_si, p10_upd, p[:, 1, 0])
+                p[:, 1, 1] = torch.where(valid_si, p11_upd, p[:, 1, 1])
+
+        if future_steps is None:
+            future_steps_tensor = torch.full(
+                (b,), float(self.config.future_condition_delta), device=device, dtype=dtype
+            )
+        elif isinstance(future_steps, Tensor):
+            if future_steps.ndim != 1 or future_steps.shape[0] != b:
+                raise ValueError(
+                    f"`future_steps` tensor must have shape ({b},). Got {tuple(future_steps.shape)}."
+                )
+            future_steps_tensor = future_steps.to(device=device, dtype=dtype)
+        else:
+            future_steps_tensor = torch.full((b,), float(future_steps), device=device, dtype=dtype)
+
+        horizon_dt = dt[:, -1] * future_steps_tensor
+        horizon_dt = horizon_dt.unsqueeze(1).expand(b, d).reshape(-1)
+        pred = x[:, 0] + horizon_dt * x[:, 1]
+        return pred.view(b, d)
+
     def _split_state_sequence(self, state_obs: Tensor) -> tuple[Tensor, Tensor | None]:
         if state_obs.ndim != 3:
             raise ValueError(f"`{OBS_STATE}` must have shape (B, S, D). Got {tuple(state_obs.shape)}.")
@@ -307,7 +500,7 @@ class DiffusionModel(nn.Module):
         state_history = state_obs[:, : self.config.n_obs_steps]
         future_state = None
         if self._use_future_robot_state and state_obs.shape[1] > self.config.n_obs_steps:
-            future_state = state_obs[:, self.config.n_obs_steps]
+            future_state = state_obs[:, self.config.n_obs_steps :]
         return state_history, future_state
 
     def _prepare_future_conditioning(
@@ -316,18 +509,30 @@ class DiffusionModel(nn.Module):
         batch_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        state_history_obs: Tensor,
         future_state_obs: Tensor | None,
     ) -> Tensor | None:
         future_parts: list[Tensor] = []
+        future_delay_indices = self._select_future_delay_indices(batch_size, device=device)
+        future_delay_steps = self._future_delay_steps_from_indices(
+            future_delay_indices, device=device, dtype=dtype
+        )
 
         if self._use_future_robot_state:
             if self.future_state_gate is None:
                 raise RuntimeError("future_state_gate is not initialized.")
-            state_cond = (
-                future_state_obs.reshape(batch_size, -1).to(device=device, dtype=dtype)
-                if future_state_obs is not None
-                else torch.zeros((batch_size, self._future_state_cond_dim), device=device, dtype=dtype)
-            )
+            if future_state_obs is not None:
+                state_future = self._select_future_from_explicit_sequence(
+                    future_state_obs, future_delay_indices, branch_name="state"
+                )
+                state_cond = state_future.reshape(batch_size, -1).to(device=device, dtype=dtype)
+            else:
+                # Online eval path: no explicit future state in batch, predict it from history.
+                state_cond = self._predict_future_observation_with_kalman(
+                    state_history_obs, batch, future_steps=future_delay_steps
+                ).to(
+                    device=device, dtype=dtype
+                )
             if state_cond.shape[-1] != self._future_state_cond_dim:
                 raise ValueError(
                     f"Future state dim mismatch. Expected {self._future_state_cond_dim}, got {state_cond.shape[-1]}."
@@ -340,6 +545,8 @@ class DiffusionModel(nn.Module):
                 raise RuntimeError("future_ball_pos_mlp/future_ball_pos_gate are not initialized.")
 
             ball_future: Tensor | None = None
+            ball_history: Tensor | None = None
+            ball_future_seq: Tensor | None = None
             if self.config.future_ball_pos_key in batch:
                 ball_obs = batch[self.config.future_ball_pos_key]
                 if ball_obs.ndim == 2:
@@ -349,13 +556,56 @@ class DiffusionModel(nn.Module):
                         f"`{self.config.future_ball_pos_key}` must have shape (B, S, D). "
                         f"Got {tuple(ball_obs.shape)}."
                     )
-                if ball_obs.shape[1] > 0:
-                    ball_future = ball_obs[:, -1].reshape(batch_size, -1).to(device=device, dtype=dtype)
+                seq_len = ball_obs.shape[1]
+
+                if seq_len == self._future_delay_count:
+                    # Offline dataset path for scene_only/robot_scene: explicit future candidates only.
+                    ball_future_seq = ball_obs
+                elif seq_len > self.config.n_obs_steps:
+                    ball_history = ball_obs[:, : self.config.n_obs_steps]
+                    ball_future_seq = ball_obs[:, self.config.n_obs_steps :]
+                else:
+                    # Online eval path: only history is available in the observation queue.
+                    ball_history = ball_obs[:, : min(seq_len, self.config.n_obs_steps)]
+
+                if ball_future_seq is not None and ball_future_seq.shape[1] > 0:
+                    ball_future = self._select_future_from_explicit_sequence(
+                        ball_future_seq, future_delay_indices, branch_name=self.config.future_ball_pos_key
+                    )
+
+                if ball_future is None and ball_history is not None and ball_history.shape[1] > 0:
+                    ball_future = self._predict_future_observation_with_kalman(
+                        ball_history, batch, future_steps=future_delay_steps
+                    )
+
+                if ball_future is not None:
+                    ball_future = ball_future.reshape(batch_size, -1).to(device=device, dtype=dtype)
                     if ball_future.shape[-1] != self._future_ball_pos_in_dim:
                         raise ValueError(
                             "Future ball_pos dim mismatch. "
                             f"Expected {self._future_ball_pos_in_dim}, got {ball_future.shape[-1]}."
                         )
+
+            # In training we require explicit future ball_pos from dataset and disallow fallback paths.
+            if self.training:
+                if self.config.future_ball_pos_key not in batch:
+                    raise ValueError(
+                        "Missing required dataset feature for training: "
+                        f"`{self.config.future_ball_pos_key}`. "
+                        f"Batch keys: {sorted(batch.keys())}."
+                    )
+                if ball_future_seq is None:
+                    ball_obs_shape = (
+                        tuple(batch[self.config.future_ball_pos_key].shape)
+                        if self.config.future_ball_pos_key in batch
+                        else None
+                    )
+                    raise ValueError(
+                        "Training requires explicit future ball_pos from dataset, but got no explicit "
+                        "future sequence. Fallback (history/Kalman/zeros) is disabled. "
+                        f"`{self.config.future_ball_pos_key}` shape={ball_obs_shape}, "
+                        f"expected future candidates={self._future_delay_count}."
+                    )
 
             if ball_future is None:
                 ball_cond = torch.zeros(
@@ -483,6 +733,7 @@ class DiffusionModel(nn.Module):
             batch_size=batch_size,
             dtype=state_obs.dtype,
             device=state_obs.device,
+            state_history_obs=state_obs,
             future_state_obs=future_state_obs,
         )
 
@@ -530,18 +781,7 @@ class DiffusionModel(nn.Module):
         valid = torch.isfinite(z).all(dim=-1)
         z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
 
-        dt = torch.full((b, s), float(self.config.kalman_dt_fallback), device=device, dtype=dtype)
-        if "timestamp" in batch:
-            ts = batch["timestamp"]
-            if ts.ndim == 1:
-                ts = ts.unsqueeze(1)
-            if ts.ndim >= 2 and ts.shape[0] == b and ts.shape[1] == s:
-                dt[:, 1:] = (ts[:, 1:] - ts[:, :-1]).to(dtype=dtype)
-                dt = torch.where(
-                    (dt > 0) & torch.isfinite(dt),
-                    dt,
-                    torch.full_like(dt, float(self.config.kalman_dt_fallback)),
-                )
+        dt = self._resolve_kalman_dt(batch, b, s, device=device, dtype=dtype)
 
         def _make_f_q(step_dt: Tensor) -> tuple[Tensor, Tensor]:
             step_dt = step_dt.to(dtype=dtype)
