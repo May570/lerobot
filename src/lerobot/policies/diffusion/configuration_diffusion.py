@@ -85,6 +85,8 @@ class DiffusionConfig(PreTrainedConfig):
         delay_random_probs: Sampling probabilities aligned with `delay_random_deltas`.
         future_ball_pos_key: Observation key used by scene branches for future ball position.
         future_ball_pos_mlp_dim: Output width of the future ball_pos MLP branch before gating.
+        disable_future_condition_gate: Whether to bypass the learned gate on future-conditioning
+            branches. Only valid for non-`orig` model modes.
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
         kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
@@ -174,6 +176,7 @@ class DiffusionConfig(PreTrainedConfig):
     delay_random_probs: tuple[float, ...] = (0.08, 0.17, 0.29, 0.29, 0.17)
     future_ball_pos_key: str = "observation.ball_pos"
     future_ball_pos_mlp_dim: int = 8
+    disable_future_condition_gate: bool = False
     # Experimental: direct online Kalman conditioning branch.
     enable_kalman_condition: bool = False
     kalman_feature_mode: str = "full10"
@@ -246,6 +249,11 @@ class DiffusionConfig(PreTrainedConfig):
         if self.model not in {"orig", "robot_only", "scene_only", "robot_scene"}:
             raise ValueError(
                 "`model` must be one of {'orig', 'robot_only', 'scene_only', 'robot_scene'}. "
+                f"Got {self.model}."
+            )
+        if self.disable_future_condition_gate and self.model == "orig":
+            raise ValueError(
+                "`disable_future_condition_gate=True` requires a non-`orig` model. "
                 f"Got {self.model}."
             )
         if self.future_condition_delta <= 0:

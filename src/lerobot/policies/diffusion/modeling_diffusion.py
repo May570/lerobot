@@ -187,6 +187,7 @@ class DiffusionModel(nn.Module):
         self._future_mode = self.config.model
         self._use_future_robot_state = self._future_mode in {"robot_only", "robot_scene"}
         self._use_future_ball_pos = self._future_mode in {"scene_only", "robot_scene"}
+        self._disable_future_condition_gate = self.config.disable_future_condition_gate
         self._future_delay_deltas = tuple(int(d) for d in self.config.future_condition_deltas)
         self._future_delay_count = len(self._future_delay_deltas)
         self._future_delay_index_by_delta = {delta: i for i, delta in enumerate(self._future_delay_deltas)}
@@ -242,10 +243,11 @@ class DiffusionModel(nn.Module):
         if self._use_future_robot_state:
             self._future_state_cond_dim = self.config.robot_state_feature.shape[0]
             future_cond_dim += self._future_state_cond_dim
-            self.future_state_gate = nn.Sequential(
-                nn.Linear(self._future_state_cond_dim, self._future_state_cond_dim),
-                nn.Sigmoid(),
-            )
+            if not self._disable_future_condition_gate:
+                self.future_state_gate = nn.Sequential(
+                    nn.Linear(self._future_state_cond_dim, self._future_state_cond_dim),
+                    nn.Sigmoid(),
+                )
         if self._use_future_ball_pos:
             if self.config.input_features is None or self.config.future_ball_pos_key not in self.config.input_features:
                 raise ValueError(
@@ -259,10 +261,11 @@ class DiffusionModel(nn.Module):
                 nn.SiLU(),
                 nn.Linear(self._future_ball_pos_cond_dim, self._future_ball_pos_cond_dim),
             )
-            self.future_ball_pos_gate = nn.Sequential(
-                nn.Linear(self._future_ball_pos_cond_dim, self._future_ball_pos_cond_dim),
-                nn.Sigmoid(),
-            )
+            if not self._disable_future_condition_gate:
+                self.future_ball_pos_gate = nn.Sequential(
+                    nn.Linear(self._future_ball_pos_cond_dim, self._future_ball_pos_cond_dim),
+                    nn.Sigmoid(),
+                )
 
         full_global_cond_dim = non_kalman_global_cond_dim + kalman_cond_dim
         non_kalman_global_cond_dim_flat = non_kalman_global_cond_dim * config.n_obs_steps + future_cond_dim
@@ -354,9 +357,22 @@ class DiffusionModel(nn.Module):
             )
         return torch.full((batch_size,), fixed_idx, device=device, dtype=torch.long)
 
-    def _future_delay_steps_from_indices(self, delay_indices: Tensor, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+    def _future_delay_steps_from_indices(
+        self,
+        delay_indices: Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
         delay_values = torch.tensor(self._future_delay_deltas, device=device, dtype=dtype)
         return delay_values[delay_indices]
+
+    def _maybe_apply_future_gate(self, cond: Tensor, gate: nn.Module | None, *, gate_name: str) -> Tensor:
+        if self._disable_future_condition_gate:
+            return cond
+        if gate is None:
+            raise RuntimeError(f"{gate_name} is not initialized.")
+        return cond * gate(cond)
 
     def _select_future_from_explicit_sequence(
         self,
@@ -519,8 +535,6 @@ class DiffusionModel(nn.Module):
         )
 
         if self._use_future_robot_state:
-            if self.future_state_gate is None:
-                raise RuntimeError("future_state_gate is not initialized.")
             if future_state_obs is not None:
                 state_future = self._select_future_from_explicit_sequence(
                     future_state_obs, future_delay_indices, branch_name="state"
@@ -537,12 +551,16 @@ class DiffusionModel(nn.Module):
                 raise ValueError(
                     f"Future state dim mismatch. Expected {self._future_state_cond_dim}, got {state_cond.shape[-1]}."
                 )
-            state_cond = state_cond * self.future_state_gate(state_cond)
+            state_cond = self._maybe_apply_future_gate(
+                state_cond,
+                self.future_state_gate,
+                gate_name="future_state_gate",
+            )
             future_parts.append(state_cond)
 
         if self._use_future_ball_pos:
-            if self.future_ball_pos_mlp is None or self.future_ball_pos_gate is None:
-                raise RuntimeError("future_ball_pos_mlp/future_ball_pos_gate are not initialized.")
+            if self.future_ball_pos_mlp is None:
+                raise RuntimeError("future_ball_pos_mlp is not initialized.")
 
             ball_future: Tensor | None = None
             ball_history: Tensor | None = None
@@ -615,7 +633,11 @@ class DiffusionModel(nn.Module):
                 )
             else:
                 ball_cond = self.future_ball_pos_mlp(ball_future)
-                ball_cond = ball_cond * self.future_ball_pos_gate(ball_cond)
+                ball_cond = self._maybe_apply_future_gate(
+                    ball_cond,
+                    self.future_ball_pos_gate,
+                    gate_name="future_ball_pos_gate",
+                )
 
             future_parts.append(ball_cond)
 

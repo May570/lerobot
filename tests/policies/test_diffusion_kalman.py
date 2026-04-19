@@ -56,6 +56,7 @@ def _make_future_mode_config(
     *,
     model: str,
     include_ball_pos: bool = False,
+    disable_future_condition_gate: bool = False,
     delay_random: bool = False,
     delay_random_deltas: tuple[int, ...] = (2, 3, 4, 5, 6),
     delay_random_probs: tuple[float, ...] = (0.08, 0.17, 0.29, 0.29, 0.17),
@@ -73,6 +74,7 @@ def _make_future_mode_config(
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
         device="cpu",
         model=model,
+        disable_future_condition_gate=disable_future_condition_gate,
         delay_random=delay_random,
         delay_random_deltas=delay_random_deltas,
         delay_random_probs=delay_random_probs,
@@ -307,6 +309,11 @@ def test_delay_random_observation_delta_indices_by_key():
     }
 
 
+def test_disable_future_condition_gate_requires_non_orig_model():
+    with pytest.raises(ValueError, match="requires a non-`orig` model"):
+        _make_future_mode_config(model="orig", disable_future_condition_gate=True)
+
+
 def test_robot_only_future_state_gate_is_appended_to_global_condition():
     cfg_orig = _make_future_mode_config(model="orig")
     policy_orig = DiffusionPolicy(cfg_orig)
@@ -331,6 +338,30 @@ def test_robot_only_future_state_gate_is_appended_to_global_condition():
     assert torch.allclose(cond_robot[:, -8:], expected_future, atol=1e-6)
 
 
+def test_robot_only_future_state_can_bypass_gate():
+    cfg_orig = _make_future_mode_config(model="orig")
+    policy_orig = DiffusionPolicy(cfg_orig)
+    model_orig = policy_orig.diffusion
+
+    cfg_robot = _make_future_mode_config(model="robot_only", disable_future_condition_gate=True)
+    policy_robot = DiffusionPolicy(cfg_robot)
+    model_robot = policy_robot.diffusion
+
+    batch_robot = _make_future_mode_batch(include_future_state=True, include_ball_pos=False)
+    batch_orig = {
+        OBS_STATE: batch_robot[OBS_STATE][:, :2],
+        OBS_ENV_STATE: batch_robot[OBS_ENV_STATE],
+    }
+
+    cond_orig = model_orig._prepare_global_conditioning(batch_orig)
+    cond_robot = model_robot._prepare_global_conditioning(batch_robot)
+
+    future_state = batch_robot[OBS_STATE][:, 2]
+    assert model_robot.future_state_gate is None
+    assert torch.allclose(cond_robot[:, : cond_orig.shape[-1]], cond_orig, atol=1e-6)
+    assert torch.allclose(cond_robot[:, -8:], future_state, atol=1e-6)
+
+
 def test_scene_only_future_ball_pos_uses_mlp_and_gate():
     cfg_orig = _make_future_mode_config(model="orig")
     policy_orig = DiffusionPolicy(cfg_orig)
@@ -349,6 +380,28 @@ def test_scene_only_future_ball_pos_uses_mlp_and_gate():
     ball_pos = batch_scene["observation.ball_pos"][:, -1]
     expected_scene = model_scene.future_ball_pos_mlp(ball_pos)
     expected_scene = expected_scene * model_scene.future_ball_pos_gate(expected_scene)
+    assert torch.allclose(cond_scene[:, : cond_orig.shape[-1]], cond_orig, atol=1e-6)
+    assert torch.allclose(cond_scene[:, -8:], expected_scene, atol=1e-6)
+
+
+def test_scene_only_future_ball_pos_can_bypass_gate():
+    cfg_orig = _make_future_mode_config(model="orig")
+    policy_orig = DiffusionPolicy(cfg_orig)
+    model_orig = policy_orig.diffusion
+
+    cfg_scene = _make_future_mode_config(model="scene_only", include_ball_pos=True, disable_future_condition_gate=True)
+    policy_scene = DiffusionPolicy(cfg_scene)
+    model_scene = policy_scene.diffusion
+
+    batch_orig = _make_future_mode_batch(include_future_state=False, include_ball_pos=False)
+    batch_scene = _make_future_mode_batch(include_future_state=False, include_ball_pos=True)
+
+    cond_orig = model_orig._prepare_global_conditioning(batch_orig)
+    cond_scene = model_scene._prepare_global_conditioning(batch_scene)
+
+    ball_pos = batch_scene["observation.ball_pos"][:, -1]
+    expected_scene = model_scene.future_ball_pos_mlp(ball_pos)
+    assert model_scene.future_ball_pos_gate is None
     assert torch.allclose(cond_scene[:, : cond_orig.shape[-1]], cond_orig, atol=1e-6)
     assert torch.allclose(cond_scene[:, -8:], expected_scene, atol=1e-6)
 
