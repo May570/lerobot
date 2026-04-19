@@ -268,6 +268,23 @@ class LiberoEnv(EnvConfig):
     render_mode: str = "rgb_array"
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
     init_states: bool = True
+    init_plan_path: str | None = None
+    init_plan_loop: bool = True
+    init_plan_default_direction_deg: float = 270.0
+    init_plan_default_speed: float = 0.30
+    init_plan_default_ball_start_x: float = 0.04
+    init_plan_default_ball_start_y: float = 0.26
+    init_plan_ball_start_xy_safety_scale: float = 0.92
+    init_plan_ball_start_z_clearance: float = 0.0015
+    init_plan_launch_settle_steps: int = 6
+    init_plan_launch_ramp_steps: int = 8
+    init_plan_warmup_steps: int = 0
+    # Ball-grasp evaluation mode used by realtime eval metrics.
+    # "legacy" preserves the current loose logic; "strict" adds stronger geometric constraints.
+    ball_grasp_eval_mode: str = "legacy"
+    ball_grasp_strict_lift_multiplier: float = 1.0
+    ball_grasp_strict_grip_center_max_dist: float = 0.055
+    ball_grasp_strict_require_pad_contact: bool = True
     camera_name_mapping: dict[str, str] | None = None
     observation_height: int = 360
     observation_width: int = 360
@@ -293,6 +310,22 @@ class LiberoEnv(EnvConfig):
     control_mode: str = "relative"  # or "absolute"
 
     def __post_init__(self):
+        if self.ball_grasp_eval_mode not in {"legacy", "strict"}:
+            raise ValueError(
+                "`ball_grasp_eval_mode` must be one of {'legacy', 'strict'}. "
+                f"Got: {self.ball_grasp_eval_mode!r}"
+            )
+        if self.ball_grasp_strict_lift_multiplier < 0:
+            raise ValueError(
+                "`ball_grasp_strict_lift_multiplier` must be >= 0. "
+                f"Got: {self.ball_grasp_strict_lift_multiplier}"
+            )
+        if self.ball_grasp_strict_grip_center_max_dist <= 0:
+            raise ValueError(
+                "`ball_grasp_strict_grip_center_max_dist` must be > 0. "
+                f"Got: {self.ball_grasp_strict_grip_center_max_dist}"
+            )
+
         if self.obs_type == "pixels":
             self.features[LIBERO_KEY_PIXELS_AGENTVIEW] = PolicyFeature(
                 type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
@@ -341,8 +374,24 @@ class LiberoEnv(EnvConfig):
     @property
     def gym_kwargs(self) -> dict:
         kwargs: dict[str, Any] = {"obs_type": self.obs_type, "render_mode": self.render_mode}
+        kwargs["ball_grasp_eval_mode"] = self.ball_grasp_eval_mode
+        kwargs["ball_grasp_strict_lift_multiplier"] = self.ball_grasp_strict_lift_multiplier
+        kwargs["ball_grasp_strict_grip_center_max_dist"] = self.ball_grasp_strict_grip_center_max_dist
+        kwargs["ball_grasp_strict_require_pad_contact"] = self.ball_grasp_strict_require_pad_contact
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
+        if self.init_plan_path:
+            kwargs["init_plan_path"] = self.init_plan_path
+            kwargs["init_plan_loop"] = self.init_plan_loop
+            kwargs["init_plan_default_direction_deg"] = self.init_plan_default_direction_deg
+            kwargs["init_plan_default_speed"] = self.init_plan_default_speed
+            kwargs["init_plan_default_ball_start_x"] = self.init_plan_default_ball_start_x
+            kwargs["init_plan_default_ball_start_y"] = self.init_plan_default_ball_start_y
+            kwargs["init_plan_ball_start_xy_safety_scale"] = self.init_plan_ball_start_xy_safety_scale
+            kwargs["init_plan_ball_start_z_clearance"] = self.init_plan_ball_start_z_clearance
+            kwargs["init_plan_launch_settle_steps"] = self.init_plan_launch_settle_steps
+            kwargs["init_plan_launch_ramp_steps"] = self.init_plan_launch_ramp_steps
+            kwargs["init_plan_warmup_steps"] = self.init_plan_warmup_steps
         return kwargs
 
 

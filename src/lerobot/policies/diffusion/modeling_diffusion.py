@@ -204,6 +204,7 @@ class DiffusionModel(nn.Module):
         self.future_state_gate: nn.Module | None = None
         self.future_ball_pos_mlp: nn.Module | None = None
         self.future_ball_pos_gate: nn.Module | None = None
+        self._last_future_gate_debug: dict[str, list[float]] | None = None
 
         # Build observation encoders (depending on which observations are provided).
         non_kalman_global_cond_dim = self.config.robot_state_feature.shape[0]
@@ -529,6 +530,7 @@ class DiffusionModel(nn.Module):
         future_state_obs: Tensor | None,
     ) -> Tensor | None:
         future_parts: list[Tensor] = []
+        future_gate_debug: dict[str, Tensor] = {}
         future_delay_indices = self._select_future_delay_indices(batch_size, device=device)
         future_delay_steps = self._future_delay_steps_from_indices(
             future_delay_indices, device=device, dtype=dtype
@@ -556,6 +558,8 @@ class DiffusionModel(nn.Module):
                 self.future_state_gate,
                 gate_name="future_state_gate",
             )
+            if not self._disable_future_condition_gate:
+                future_gate_debug["future_state_gate_mean"] = state_gate.mean(dim=-1)
             future_parts.append(state_cond)
 
         if self._use_future_ball_pos:
@@ -638,12 +642,30 @@ class DiffusionModel(nn.Module):
                     self.future_ball_pos_gate,
                     gate_name="future_ball_pos_gate",
                 )
+                if not self._disable_future_condition_gate:
+                    future_gate_debug["future_ball_pos_gate_mean"] = ball_gate.mean(dim=-1)
 
             future_parts.append(ball_cond)
+
+        if future_gate_debug:
+            self._last_future_gate_debug = {
+                key: tensor.detach().to(device="cpu", dtype=torch.float32).tolist()
+                for key, tensor in future_gate_debug.items()
+            }
+        else:
+            self._last_future_gate_debug = None
 
         if not future_parts:
             return None
         return torch.cat(future_parts, dim=-1)
+
+    def get_last_future_gate_debug(self, clear: bool = False) -> dict[str, list[float]] | None:
+        if self._last_future_gate_debug is None:
+            return None
+        debug = {key: list(values) for key, values in self._last_future_gate_debug.items()}
+        if clear:
+            self._last_future_gate_debug = None
+        return debug
 
     # ========= inference  ============
     def conditional_sample(

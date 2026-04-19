@@ -16,6 +16,9 @@
 from __future__ import annotations
 
 import os
+import json
+import logging
+import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
@@ -30,6 +33,9 @@ from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.processor import RobotObservation
+
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
@@ -116,6 +122,21 @@ class LiberoEnv(gym.Env):
         camera_name_mapping: dict[str, str] | None = None,
         num_steps_wait: int = 10,
         control_mode: str = "relative",
+        init_plan_path: str | None = None,
+        init_plan_loop: bool = True,
+        init_plan_default_direction_deg: float = 270.0,
+        init_plan_default_speed: float = 0.30,
+        init_plan_default_ball_start_x: float = 0.04,
+        init_plan_default_ball_start_y: float = 0.26,
+        init_plan_ball_start_xy_safety_scale: float = 0.92,
+        init_plan_ball_start_z_clearance: float = 0.0015,
+        init_plan_launch_settle_steps: int = 6,
+        init_plan_launch_ramp_steps: int = 8,
+        init_plan_warmup_steps: int = 0,
+        ball_grasp_eval_mode: str = "legacy",
+        ball_grasp_strict_lift_multiplier: float = 1.0,
+        ball_grasp_strict_grip_center_max_dist: float = 0.055,
+        ball_grasp_strict_require_pad_contact: bool = True,
     ):
         super().__init__()
         self.task_id = task_id
@@ -158,6 +179,41 @@ class LiberoEnv(gym.Env):
             else self.episode_length
         )
         self.control_mode = control_mode
+        self._init_plan_path = Path(init_plan_path).expanduser() if init_plan_path else None
+        self._init_plan_loop = bool(init_plan_loop)
+        self._init_plan_default_direction_deg = float(init_plan_default_direction_deg)
+        self._init_plan_default_speed = float(init_plan_default_speed)
+        self._init_plan_default_ball_start_x = float(init_plan_default_ball_start_x)
+        self._init_plan_default_ball_start_y = float(init_plan_default_ball_start_y)
+        self._init_plan_ball_start_xy_safety_scale = float(init_plan_ball_start_xy_safety_scale)
+        self._init_plan_ball_start_z_clearance = float(init_plan_ball_start_z_clearance)
+        self._init_plan_launch_settle_steps = int(init_plan_launch_settle_steps)
+        self._init_plan_launch_ramp_steps = int(init_plan_launch_ramp_steps)
+        self._init_plan_warmup_steps = int(init_plan_warmup_steps)
+        self._ball_grasp_eval_mode = str(ball_grasp_eval_mode)
+        if self._ball_grasp_eval_mode not in {"legacy", "strict"}:
+            raise ValueError(
+                f"`ball_grasp_eval_mode` must be one of {{'legacy', 'strict'}}. Got {self._ball_grasp_eval_mode!r}."
+            )
+        self._ball_grasp_strict_lift_multiplier = float(ball_grasp_strict_lift_multiplier)
+        self._ball_grasp_strict_grip_center_max_dist = float(ball_grasp_strict_grip_center_max_dist)
+        self._ball_grasp_strict_require_pad_contact = bool(ball_grasp_strict_require_pad_contact)
+        self._init_plan_rows = self._load_init_plan_rows(self._init_plan_path)
+        self._init_plan_index = self.episode_index
+        self._init_plan_stride = n_envs
+        self._dyn_ball_body_id: int | None = None
+        self._dyn_ball_joint_name: str | None = None
+        self._dyn_table_collision_geom_id: int | None = None
+        self._dyn_table_body_id: int | None = None
+        self._dyn_base_table_quat: np.ndarray | None = None
+        self._dyn_ball_geom_ids: tuple[int, ...] = tuple()
+        self._dyn_left_finger_geom_ids: tuple[int, ...] = tuple()
+        self._dyn_right_finger_geom_ids: tuple[int, ...] = tuple()
+        self._dyn_left_fingerpad_geom_ids: tuple[int, ...] = tuple()
+        self._dyn_right_fingerpad_geom_ids: tuple[int, ...] = tuple()
+        self._dyn_grip_site_id: int | None = None
+        self._dyn_ball_radius: float | None = None
+        self._dyn_handles_ready = False
         images = {}
         for cam in self.camera_name:
             images[self.camera_name_mapping[cam]] = spaces.Box(
@@ -242,6 +298,455 @@ class LiberoEnv(gym.Env):
         env.reset()
         return env
 
+    @staticmethod
+    def _load_init_plan_rows(plan_path: Path | None) -> list[dict[str, Any]]:
+        if plan_path is None:
+            return []
+        if not plan_path.exists():
+            raise FileNotFoundError(f"LIBERO init plan file does not exist: {plan_path}")
+        rows: list[dict[str, Any]] = []
+        with plan_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    rows.append(obj)
+        if len(rows) == 0:
+            raise ValueError(f"LIBERO init plan file is empty: {plan_path}")
+        logger.info("Loaded %d init-plan rows from %s", len(rows), plan_path)
+        return rows
+
+    @staticmethod
+    def _safe_float(raw: Any, default: float) -> float:
+        try:
+            return float(raw)
+        except Exception:  # noqa: BLE001
+            return float(default)
+
+    @staticmethod
+    def _safe_int(raw: Any, default: int) -> int:
+        try:
+            return int(raw)
+        except Exception:  # noqa: BLE001
+            return int(default)
+
+    @staticmethod
+    def _find_body_id_contains(model: Any, name_fragment: str) -> int:
+        for i in range(model.nbody):
+            name = model.body_id2name(i)
+            if name and name_fragment in name:
+                return int(i)
+        raise KeyError(f"No body name containing '{name_fragment}'")
+
+    @staticmethod
+    def _find_table_collision_geom_id(model: Any) -> int:
+        try:
+            return int(model.geom_name2id("table_collision"))
+        except Exception:  # noqa: BLE001
+            for i in range(model.ngeom):
+                name = model.geom_id2name(i)
+                if name and "table_collision" in name:
+                    return int(i)
+        raise KeyError("Could not find table collision geom.")
+
+    @staticmethod
+    def _axis_angle_to_quat(axis: np.ndarray, angle_rad: float) -> np.ndarray:
+        axis = np.asarray(axis, dtype=np.float64)
+        norm = float(np.linalg.norm(axis))
+        if norm <= 1e-12:
+            return np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        axis = axis / norm
+        half = 0.5 * float(angle_rad)
+        s = math.sin(half)
+        return np.asarray([math.cos(half), axis[0] * s, axis[1] * s, axis[2] * s], dtype=np.float64)
+
+    @classmethod
+    def _tilt_quat(cls, direction_deg: float, tilt_deg: float) -> np.ndarray:
+        theta = math.radians(float(direction_deg))
+        axis = np.asarray([-math.sin(theta), math.cos(theta), 0.0], dtype=np.float64)
+        return cls._axis_angle_to_quat(axis=axis, angle_rad=math.radians(float(tilt_deg)))
+
+    def _resolve_dyn_handles(self) -> None:
+        if self._dyn_handles_ready:
+            return
+
+        model = self._env.sim.model
+        try:
+            self._dyn_ball_joint_name = "ball_1_joint0"
+            model.joint_name2id(self._dyn_ball_joint_name)
+        except Exception:  # noqa: BLE001
+            self._dyn_ball_joint_name = None
+
+        try:
+            self._dyn_ball_body_id = self._find_body_id_contains(model, "ball_1")
+        except Exception:  # noqa: BLE001
+            self._dyn_ball_body_id = None
+
+        try:
+            self._dyn_table_collision_geom_id = self._find_table_collision_geom_id(model)
+        except Exception:  # noqa: BLE001
+            self._dyn_table_collision_geom_id = None
+
+        if self._dyn_table_collision_geom_id is not None:
+            try:
+                self._dyn_table_body_id = int(model.geom_bodyid[self._dyn_table_collision_geom_id])
+                self._dyn_base_table_quat = np.asarray(
+                    model.body_quat[self._dyn_table_body_id], dtype=np.float64
+                ).copy()
+            except Exception:  # noqa: BLE001
+                self._dyn_table_body_id = None
+                self._dyn_base_table_quat = None
+
+        if self._dyn_ball_body_id is not None:
+            ball_geom_ids: list[int] = []
+            ball_radius_candidates: list[float] = []
+            for gid in range(model.ngeom):
+                if int(model.geom_bodyid[gid]) != int(self._dyn_ball_body_id):
+                    continue
+                name = model.geom_id2name(gid)
+                if name and "vis" in name.lower():
+                    continue
+                ball_geom_ids.append(int(gid))
+                size = np.asarray(model.geom_size[gid], dtype=np.float64).reshape(-1)
+                if size.size > 0:
+                    ball_radius_candidates.append(float(size[0]))
+            self._dyn_ball_geom_ids = tuple(ball_geom_ids)
+            self._dyn_ball_radius = max(ball_radius_candidates) if ball_radius_candidates else 0.02
+
+        left_names: set[str] = set()
+        right_names: set[str] = set()
+        left_pad_names: set[str] = set()
+        right_pad_names: set[str] = set()
+        try:
+            gripper = self._env.robots[0].gripper
+            important_geoms = getattr(gripper, "important_geoms", {}) or {}
+            for key, values in important_geoms.items():
+                key_l = str(key).lower()
+                geom_names = values if isinstance(values, (list, tuple)) else [values]
+                if "left" in key_l and "finger" in key_l:
+                    left_names.update(str(n) for n in geom_names if n)
+                if "right" in key_l and "finger" in key_l:
+                    right_names.update(str(n) for n in geom_names if n)
+                if "left" in key_l and "fingerpad" in key_l:
+                    left_pad_names.update(str(n) for n in geom_names if n)
+                if "right" in key_l and "fingerpad" in key_l:
+                    right_pad_names.update(str(n) for n in geom_names if n)
+            important_sites = getattr(gripper, "important_sites", {}) or {}
+            grip_site_name = important_sites.get("grip_site")
+            if isinstance(grip_site_name, str) and grip_site_name:
+                try:
+                    self._dyn_grip_site_id = int(model.site_name2id(grip_site_name))
+                except Exception:  # noqa: BLE001
+                    self._dyn_grip_site_id = None
+        except Exception:  # noqa: BLE001
+            pass
+
+        if not left_names or not right_names:
+            for gid in range(model.ngeom):
+                name = model.geom_id2name(gid)
+                if not name:
+                    continue
+                lowered = name.lower()
+                if "gripper0_finger1" in lowered:
+                    left_names.add(name)
+                elif "gripper0_finger2" in lowered:
+                    right_names.add(name)
+                if "gripper0_finger1_pad" in lowered:
+                    left_pad_names.add(name)
+                elif "gripper0_finger2_pad" in lowered:
+                    right_pad_names.add(name)
+
+        left_ids: list[int] = []
+        for name in sorted(left_names):
+            try:
+                left_ids.append(int(model.geom_name2id(name)))
+            except Exception:  # noqa: BLE001
+                continue
+        right_ids: list[int] = []
+        for name in sorted(right_names):
+            try:
+                right_ids.append(int(model.geom_name2id(name)))
+            except Exception:  # noqa: BLE001
+                continue
+        self._dyn_left_finger_geom_ids = tuple(left_ids)
+        self._dyn_right_finger_geom_ids = tuple(right_ids)
+        left_pad_ids: list[int] = []
+        for name in sorted(left_pad_names):
+            try:
+                left_pad_ids.append(int(model.geom_name2id(name)))
+            except Exception:  # noqa: BLE001
+                continue
+        right_pad_ids: list[int] = []
+        for name in sorted(right_pad_names):
+            try:
+                right_pad_ids.append(int(model.geom_name2id(name)))
+            except Exception:  # noqa: BLE001
+                continue
+        self._dyn_left_fingerpad_geom_ids = tuple(left_pad_ids)
+        self._dyn_right_fingerpad_geom_ids = tuple(right_pad_ids)
+
+        self._dyn_handles_ready = True
+
+    def get_ball_pos(self) -> np.ndarray | None:
+        self._resolve_dyn_handles()
+        if self._dyn_ball_body_id is None:
+            return None
+        try:
+            pos = np.asarray(self._env.sim.data.body_xpos[self._dyn_ball_body_id], dtype=np.float32).copy()
+        except Exception:  # noqa: BLE001
+            return None
+        return pos
+
+    def is_ball_grasped(self) -> bool:
+        """Best-effort grasp detector for dyn-mini ball with selectable strictness."""
+        self._resolve_dyn_handles()
+        if self._dyn_ball_body_id is None or len(self._dyn_ball_geom_ids) == 0:
+            return False
+
+        if self._ball_grasp_eval_mode == "strict":
+            return self._is_ball_grasped_strict()
+        return self._is_ball_grasped_legacy()
+
+    def _has_dual_finger_ball_contact(self, left_geom_ids: set[int], right_geom_ids: set[int]) -> bool:
+        if not left_geom_ids or not right_geom_ids:
+            return False
+        data = self._env.sim.data
+        ball_geom_ids = set(self._dyn_ball_geom_ids)
+        left_contact = False
+        right_contact = False
+        for cid in range(int(data.ncon)):
+            contact = data.contact[cid]
+            g1 = int(contact.geom1)
+            g2 = int(contact.geom2)
+            if (g1 in ball_geom_ids and g2 in left_geom_ids) or (g2 in ball_geom_ids and g1 in left_geom_ids):
+                left_contact = True
+            if (g1 in ball_geom_ids and g2 in right_geom_ids) or (g2 in ball_geom_ids and g1 in right_geom_ids):
+                right_contact = True
+            if left_contact and right_contact:
+                break
+        return left_contact and right_contact
+
+    def _ball_lifted_from_table(self, *, lift_multiplier: float) -> bool:
+        if self._dyn_table_collision_geom_id is None:
+            return True
+
+        data = self._env.sim.data
+        try:
+            ball_z = float(data.body_xpos[self._dyn_ball_body_id][2])
+            table_center_z = float(data.geom_xpos[self._dyn_table_collision_geom_id][2])
+            table_half_z = float(self._env.sim.model.geom_size[self._dyn_table_collision_geom_id][2])
+        except Exception:  # noqa: BLE001
+            return True
+
+        table_top_z = table_center_z + table_half_z
+        ball_radius = float(self._dyn_ball_radius if self._dyn_ball_radius is not None else 0.02)
+        return ball_z > table_top_z + max(0.001, float(lift_multiplier) * ball_radius)
+
+    def _ball_close_to_gripper_center(self, *, max_dist: float) -> bool:
+        if self._dyn_grip_site_id is None:
+            return True
+        data = self._env.sim.data
+        try:
+            ball_pos = np.asarray(data.body_xpos[self._dyn_ball_body_id], dtype=np.float64).reshape(3)
+            grip_pos = np.asarray(data.site_xpos[self._dyn_grip_site_id], dtype=np.float64).reshape(3)
+        except Exception:  # noqa: BLE001
+            return True
+        return float(np.linalg.norm(ball_pos - grip_pos)) <= float(max_dist)
+
+    def _is_ball_grasped_legacy(self) -> bool:
+        if len(self._dyn_left_finger_geom_ids) == 0 or len(self._dyn_right_finger_geom_ids) == 0:
+            return False
+        dual_contact = self._has_dual_finger_ball_contact(
+            left_geom_ids=set(self._dyn_left_finger_geom_ids),
+            right_geom_ids=set(self._dyn_right_finger_geom_ids),
+        )
+        if not dual_contact:
+            return False
+        # Keep legacy behavior unchanged.
+        return self._ball_lifted_from_table(lift_multiplier=0.5)
+
+    def _is_ball_grasped_strict(self) -> bool:
+        if self._ball_grasp_strict_require_pad_contact:
+            if len(self._dyn_left_fingerpad_geom_ids) == 0 or len(self._dyn_right_fingerpad_geom_ids) == 0:
+                return False
+            left_ids = set(self._dyn_left_fingerpad_geom_ids)
+            right_ids = set(self._dyn_right_fingerpad_geom_ids)
+        else:
+            if len(self._dyn_left_finger_geom_ids) == 0 or len(self._dyn_right_finger_geom_ids) == 0:
+                return False
+            left_ids = set(self._dyn_left_finger_geom_ids)
+            right_ids = set(self._dyn_right_finger_geom_ids)
+
+        if not self._has_dual_finger_ball_contact(left_geom_ids=left_ids, right_geom_ids=right_ids):
+            return False
+        if not self._ball_lifted_from_table(lift_multiplier=self._ball_grasp_strict_lift_multiplier):
+            return False
+        if not self._ball_close_to_gripper_center(max_dist=self._ball_grasp_strict_grip_center_max_dist):
+            return False
+        return True
+
+    def _apply_table_tilt(self, direction_deg: float | None, tilt_deg: float | None) -> None:
+        self._resolve_dyn_handles()
+        if self._dyn_table_body_id is None:
+            return
+        model = self._env.sim.model
+        if tilt_deg is None or direction_deg is None:
+            if self._dyn_base_table_quat is not None:
+                model.body_quat[self._dyn_table_body_id] = self._dyn_base_table_quat.astype(
+                    model.body_quat.dtype, copy=False
+                )
+            self._env.sim.forward()
+            return
+
+        quat = self._tilt_quat(direction_deg=float(direction_deg), tilt_deg=float(tilt_deg))
+        model.body_quat[self._dyn_table_body_id] = quat.astype(model.body_quat.dtype, copy=False)
+        self._env.sim.forward()
+
+    def _estimate_ball_radius(self, fallback: float = 0.02) -> float:
+        self._resolve_dyn_handles()
+        if self._dyn_ball_body_id is None:
+            return float(fallback)
+        model = self._env.sim.model
+        candidates: list[float] = []
+        for gid in range(model.ngeom):
+            if int(model.geom_bodyid[gid]) != int(self._dyn_ball_body_id):
+                continue
+            r = float(model.geom_size[gid][0])
+            if r > 1e-6:
+                candidates.append(r)
+        if not candidates:
+            return float(fallback)
+        return float(np.median(np.asarray(candidates, dtype=np.float64)))
+
+    def _set_ball_linear_velocity(self, speed: float, direction_deg: float) -> RobotObservation:
+        self._resolve_dyn_handles()
+        if self._dyn_ball_joint_name is None:
+            return self._env.env._get_observations()
+        model = self._env.sim.model
+        state = self._env.sim.get_state().flatten().copy()
+        nq = int(model.nq)
+        nv = int(model.nv)
+        qvel = state[1 + nq : 1 + nq + nv]
+
+        ball_joint_id = int(model.joint_name2id(self._dyn_ball_joint_name))
+        dof_adr = int(model.jnt_dofadr[ball_joint_id])
+        qvel[dof_adr : dof_adr + 6] = 0.0
+
+        theta = math.radians(float(direction_deg))
+        qvel[dof_adr + 0] = float(speed) * math.cos(theta)
+        qvel[dof_adr + 1] = float(speed) * math.sin(theta)
+
+        state[1 + nq : 1 + nq + nv] = qvel
+        return self._env.set_init_state(state)
+
+    def _place_ball_on_table(self, start_x: float, start_y: float) -> None:
+        self._resolve_dyn_handles()
+        if self._dyn_ball_joint_name is None or self._dyn_table_collision_geom_id is None:
+            return
+        model = self._env.sim.model
+        data = self._env.sim.data
+        table_gid = int(self._dyn_table_collision_geom_id)
+
+        table_size = np.asarray(model.geom_size[table_gid], dtype=np.float64)
+        half_x, half_y, half_z = float(table_size[0]), float(table_size[1]), float(table_size[2])
+        x_lim = max(1e-4, half_x * float(self._init_plan_ball_start_xy_safety_scale))
+        y_lim = max(1e-4, half_y * float(self._init_plan_ball_start_xy_safety_scale))
+        x_local = float(np.clip(float(start_x), -x_lim, x_lim))
+        y_local = float(np.clip(float(start_y), -y_lim, y_lim))
+
+        table_pos = np.asarray(data.geom_xpos[table_gid], dtype=np.float64).copy()
+        table_rot = np.asarray(data.geom_xmat[table_gid], dtype=np.float64).reshape(3, 3).copy()
+        ball_radius = self._estimate_ball_radius(fallback=0.02)
+        local_xyz = np.asarray(
+            [x_local, y_local, half_z + ball_radius + float(self._init_plan_ball_start_z_clearance)],
+            dtype=np.float64,
+        )
+        world_xyz = table_pos + table_rot @ local_xyz
+
+        qpos = np.asarray(data.get_joint_qpos(self._dyn_ball_joint_name), dtype=np.float64).copy()
+        qpos[:3] = world_xyz
+        data.set_joint_qpos(self._dyn_ball_joint_name, qpos)
+        data.set_joint_qvel(self._dyn_ball_joint_name, np.zeros(6, dtype=np.float64))
+        self._env.sim.forward()
+
+    def _set_ball_velocity_with_ramp(
+        self,
+        speed: float,
+        direction_deg: float,
+        settle_steps: int,
+        ramp_steps: int,
+    ) -> RobotObservation:
+        no_op = np.asarray(get_libero_dummy_action(), dtype=np.float32)
+        obs = self._set_ball_linear_velocity(speed=0.0, direction_deg=direction_deg)
+        for _ in range(max(0, int(settle_steps))):
+            obs, _, _, _ = self._env.step(no_op)
+
+        n_ramp = max(1, int(ramp_steps))
+        for i in range(1, n_ramp + 1):
+            frac = float(i) / float(n_ramp)
+            obs = self._set_ball_linear_velocity(speed=float(speed) * frac, direction_deg=direction_deg)
+            obs, _, _, _ = self._env.step(no_op)
+        return obs
+
+    def _apply_init_plan_row(self, raw_obs: RobotObservation) -> tuple[RobotObservation, bool]:
+        if len(self._init_plan_rows) == 0:
+            return raw_obs, False
+        if not self._init_plan_loop and self._init_plan_index >= len(self._init_plan_rows):
+            return raw_obs, False
+
+        row = self._init_plan_rows[self._init_plan_index % len(self._init_plan_rows)]
+        self._init_plan_index += self._init_plan_stride
+
+        direction_deg = self._safe_float(
+            row.get("direction_deg", self._init_plan_default_direction_deg),
+            self._init_plan_default_direction_deg,
+        )
+        speed = self._safe_float(row.get("speed", self._init_plan_default_speed), self._init_plan_default_speed)
+        ball_start_x = self._safe_float(
+            row.get("ball_start_x", self._init_plan_default_ball_start_x),
+            self._init_plan_default_ball_start_x,
+        )
+        ball_start_y = self._safe_float(
+            row.get("ball_start_y", self._init_plan_default_ball_start_y),
+            self._init_plan_default_ball_start_y,
+        )
+        tilt_raw = row.get("tilt_deg", None)
+        tilt_deg = self._safe_float(tilt_raw, 0.0) if tilt_raw is not None else None
+        settle_steps = self._safe_int(
+            row.get("launch_settle_steps", self._init_plan_launch_settle_steps),
+            self._init_plan_launch_settle_steps,
+        )
+        ramp_steps = self._safe_int(
+            row.get("launch_ramp_steps", self._init_plan_launch_ramp_steps),
+            self._init_plan_launch_ramp_steps,
+        )
+        warmup_steps = self._safe_int(
+            row.get("warmup_steps", self._init_plan_warmup_steps),
+            self._init_plan_warmup_steps,
+        )
+
+        try:
+            self._apply_table_tilt(direction_deg=direction_deg, tilt_deg=tilt_deg)
+            self._place_ball_on_table(start_x=ball_start_x, start_y=ball_start_y)
+            raw_obs = self._set_ball_velocity_with_ramp(
+                speed=speed,
+                direction_deg=direction_deg,
+                settle_steps=settle_steps,
+                ramp_steps=ramp_steps,
+            )
+            for _ in range(max(0, warmup_steps)):
+                raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
+            return raw_obs, True
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to apply LIBERO init-plan row on task=%s task_id=%d. Falling back to default reset.",
+                self.task,
+                self.task_id,
+            )
+            return raw_obs, False
+
     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
         images = {}
         for camera_name in self.camera_name:
@@ -301,11 +806,15 @@ class LiberoEnv(gym.Env):
             raw_obs = self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])
             self.init_state_id += self._reset_stride  # Change init_state_id when reset
 
-        # After reset, objects may be unstable (slightly floating, intersecting, etc.).
-        # Step the simulator with a no-op action for a few frames so everything settles.
-        # Increasing this value can improve determinism and reproducibility across resets.
-        for _ in range(self.num_steps_wait):
-            raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
+        used_init_plan = False
+        raw_obs, used_init_plan = self._apply_init_plan_row(raw_obs)
+
+        if not used_init_plan:
+            # After reset, objects may be unstable (slightly floating, intersecting, etc.).
+            # Step the simulator with a no-op action for a few frames so everything settles.
+            # Increasing this value can improve determinism and reproducibility across resets.
+            for _ in range(self.num_steps_wait):
+                raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
 
         if self.control_mode == "absolute":
             for robot in self._env.robots:
