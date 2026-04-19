@@ -375,6 +375,16 @@ class DiffusionModel(nn.Module):
             raise RuntimeError(f"{gate_name} is not initialized.")
         return cond * gate(cond)
 
+    def _apply_future_gate_with_debug(
+        self, cond: Tensor, gate: nn.Module | None, *, gate_name: str
+    ) -> tuple[Tensor, Tensor | None]:
+        if self._disable_future_condition_gate:
+            return cond, None
+        if gate is None:
+            raise RuntimeError(f"{gate_name} is not initialized.")
+        gate_values = gate(cond)
+        return cond * gate_values, gate_values
+
     def _select_future_from_explicit_sequence(
         self,
         future_obs: Tensor,
@@ -553,12 +563,12 @@ class DiffusionModel(nn.Module):
                 raise ValueError(
                     f"Future state dim mismatch. Expected {self._future_state_cond_dim}, got {state_cond.shape[-1]}."
                 )
-            state_cond = self._maybe_apply_future_gate(
+            state_cond, state_gate = self._apply_future_gate_with_debug(
                 state_cond,
                 self.future_state_gate,
                 gate_name="future_state_gate",
             )
-            if not self._disable_future_condition_gate:
+            if state_gate is not None:
                 future_gate_debug["future_state_gate_mean"] = state_gate.mean(dim=-1)
             future_parts.append(state_cond)
 
@@ -637,13 +647,15 @@ class DiffusionModel(nn.Module):
                 )
             else:
                 ball_cond = self.future_ball_pos_mlp(ball_future)
-                ball_cond = self._maybe_apply_future_gate(
+                ball_cond, ball_gate = self._apply_future_gate_with_debug(
                     ball_cond,
                     self.future_ball_pos_gate,
                     gate_name="future_ball_pos_gate",
                 )
-                if not self._disable_future_condition_gate:
+                if ball_gate is not None:
                     future_gate_debug["future_ball_pos_gate_mean"] = ball_gate.mean(dim=-1)
+                    # Backward-compatible alias used by existing probe/eval scripts.
+                    future_gate_debug["future_ball_gate_mean"] = ball_gate.mean(dim=-1)
 
             future_parts.append(ball_cond)
 
