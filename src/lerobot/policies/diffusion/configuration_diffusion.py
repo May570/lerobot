@@ -81,12 +81,17 @@ class DiffusionConfig(PreTrainedConfig):
         delay_random: Whether to randomize the future delay during training for non-`orig` modes.
             When enabled, future delay is sampled from `delay_random_deltas` with
             probabilities `delay_random_probs`.
+        use_kalman_future: Whether to synthesize future-conditioning targets from current/history
+            observations via Kalman prediction instead of reading explicit future values from the dataset.
+            Only valid for non-`orig` modes.
         delay_random_deltas: Candidate future delays used when `delay_random=True`.
         delay_random_probs: Sampling probabilities aligned with `delay_random_deltas`.
         future_ball_pos_key: Observation key used by scene branches for future ball position.
         future_ball_pos_mlp_dim: Output width of the future ball_pos MLP branch before gating.
         disable_future_condition_gate: Whether to bypass the learned gate on future-conditioning
             branches. Only valid for non-`orig` model modes.
+        use_history4gate: Whether future-condition gates should also see encoded observation history,
+            making them history-aware. Only valid for non-`orig` modes when future gates are enabled.
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
         kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
@@ -172,11 +177,13 @@ class DiffusionConfig(PreTrainedConfig):
     model: str = "orig"
     future_condition_delta: int = 2
     delay_random: bool = False
+    use_kalman_future: bool = False
     delay_random_deltas: tuple[int, ...] = (2, 3, 4, 5, 6)
     delay_random_probs: tuple[float, ...] = (0.08, 0.17, 0.29, 0.29, 0.17)
     future_ball_pos_key: str = "observation.ball_pos"
     future_ball_pos_mlp_dim: int = 8
     disable_future_condition_gate: bool = False
+    use_history4gate: bool = False
     # Experimental: direct online Kalman conditioning branch.
     enable_kalman_condition: bool = False
     kalman_feature_mode: str = "full10"
@@ -256,6 +263,15 @@ class DiffusionConfig(PreTrainedConfig):
                 "`disable_future_condition_gate=True` requires a non-`orig` model. "
                 f"Got {self.model}."
             )
+        if self.use_history4gate and self.model == "orig":
+            raise ValueError(
+                "`use_history4gate=True` requires a non-`orig` model. "
+                f"Got {self.model}."
+            )
+        if self.use_history4gate and self.disable_future_condition_gate:
+            raise ValueError(
+                "`use_history4gate=True` requires `disable_future_condition_gate=False`."
+            )
         if self.future_condition_delta <= 0:
             raise ValueError(
                 f"`future_condition_delta` must be > 0. Got {self.future_condition_delta}."
@@ -280,6 +296,11 @@ class DiffusionConfig(PreTrainedConfig):
                 "`future_condition_delta` must be included in `delay_random_deltas` when "
                 f"`delay_random=True` and model is non-orig. Got {self.future_condition_delta} "
                 f"not in {self.delay_random_deltas}."
+            )
+        if self.use_kalman_future and self.model == "orig":
+            raise ValueError(
+                "`use_kalman_future=True` requires a non-`orig` model. "
+                f"Got {self.model}."
             )
         if self.future_ball_pos_mlp_dim <= 0:
             raise ValueError(
@@ -414,6 +435,8 @@ class DiffusionConfig(PreTrainedConfig):
     @property
     def observation_delta_indices_by_key(self) -> dict[str, list[int]] | None:
         if self.model == "orig":
+            return None
+        if self.use_kalman_future:
             return None
 
         by_key: dict[str, list[int]] = {}

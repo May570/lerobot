@@ -205,6 +205,7 @@ class DiffusionModel(nn.Module):
         self.future_ball_pos_mlp: nn.Module | None = None
         self.future_ball_pos_gate: nn.Module | None = None
         self._last_future_gate_debug: dict[str, list[float]] | None = None
+        self._history_gate_context_dim = 0
 
         # Build observation encoders (depending on which observations are provided).
         non_kalman_global_cond_dim = self.config.robot_state_feature.shape[0]
@@ -219,6 +220,7 @@ class DiffusionModel(nn.Module):
                 non_kalman_global_cond_dim += self.rgb_encoder.feature_dim * num_images
         if self.config.env_state_feature:
             non_kalman_global_cond_dim += self.config.env_state_feature.shape[0]
+        self._history_gate_context_dim = non_kalman_global_cond_dim * config.n_obs_steps
 
         kalman_cond_dim = 0
         if self.config.enable_kalman_condition:
@@ -245,8 +247,11 @@ class DiffusionModel(nn.Module):
             self._future_state_cond_dim = self.config.robot_state_feature.shape[0]
             future_cond_dim += self._future_state_cond_dim
             if not self._disable_future_condition_gate:
+                future_state_gate_in_dim = self._future_state_cond_dim
+                if self.config.use_history4gate:
+                    future_state_gate_in_dim += self._history_gate_context_dim
                 self.future_state_gate = nn.Sequential(
-                    nn.Linear(self._future_state_cond_dim, self._future_state_cond_dim),
+                    nn.Linear(future_state_gate_in_dim, self._future_state_cond_dim),
                     nn.Sigmoid(),
                 )
         if self._use_future_ball_pos:
@@ -263,8 +268,11 @@ class DiffusionModel(nn.Module):
                 nn.Linear(self._future_ball_pos_cond_dim, self._future_ball_pos_cond_dim),
             )
             if not self._disable_future_condition_gate:
+                future_ball_gate_in_dim = self._future_ball_pos_cond_dim
+                if self.config.use_history4gate:
+                    future_ball_gate_in_dim += self._history_gate_context_dim
                 self.future_ball_pos_gate = nn.Sequential(
-                    nn.Linear(self._future_ball_pos_cond_dim, self._future_ball_pos_cond_dim),
+                    nn.Linear(future_ball_gate_in_dim, self._future_ball_pos_cond_dim),
                     nn.Sigmoid(),
                 )
 
@@ -376,13 +384,23 @@ class DiffusionModel(nn.Module):
         return cond * gate(cond)
 
     def _apply_future_gate_with_debug(
-        self, cond: Tensor, gate: nn.Module | None, *, gate_name: str
+        self,
+        cond: Tensor,
+        gate: nn.Module | None,
+        *,
+        gate_name: str,
+        history_context: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         if self._disable_future_condition_gate:
             return cond, None
         if gate is None:
             raise RuntimeError(f"{gate_name} is not initialized.")
-        gate_values = gate(cond)
+        gate_input = cond
+        if self.config.use_history4gate:
+            if history_context is None:
+                raise RuntimeError(f"{gate_name} requires history_context when use_history4gate=True.")
+            gate_input = torch.cat([cond, history_context], dim=-1)
+        gate_values = gate(gate_input)
         return cond * gate_values, gate_values
 
     def _select_future_from_explicit_sequence(
@@ -538,6 +556,7 @@ class DiffusionModel(nn.Module):
         device: torch.device,
         state_history_obs: Tensor,
         future_state_obs: Tensor | None,
+        history_gate_context: Tensor | None = None,
     ) -> Tensor | None:
         future_parts: list[Tensor] = []
         future_gate_debug: dict[str, Tensor] = {}
@@ -547,13 +566,19 @@ class DiffusionModel(nn.Module):
         )
 
         if self._use_future_robot_state:
-            if future_state_obs is not None:
+            use_explicit_future_state = future_state_obs is not None and not self.config.use_kalman_future
+            if use_explicit_future_state:
                 state_future = self._select_future_from_explicit_sequence(
                     future_state_obs, future_delay_indices, branch_name="state"
                 )
                 state_cond = state_future.reshape(batch_size, -1).to(device=device, dtype=dtype)
             else:
-                # Online eval path: no explicit future state in batch, predict it from history.
+                if self.training and not self.config.use_kalman_future:
+                    raise ValueError(
+                        "Training requires explicit future state from the dataset when "
+                        "`use_kalman_future=False`."
+                    )
+                # Online eval path or Kalman-future path: predict the future state from history.
                 state_cond = self._predict_future_observation_with_kalman(
                     state_history_obs, batch, future_steps=future_delay_steps
                 ).to(
@@ -567,6 +592,7 @@ class DiffusionModel(nn.Module):
                 state_cond,
                 self.future_state_gate,
                 gate_name="future_state_gate",
+                history_context=history_gate_context,
             )
             if state_gate is not None:
                 future_gate_debug["future_state_gate_mean"] = state_gate.mean(dim=-1)
@@ -579,6 +605,12 @@ class DiffusionModel(nn.Module):
             ball_future: Tensor | None = None
             ball_history: Tensor | None = None
             ball_future_seq: Tensor | None = None
+            if self.config.use_kalman_future and self.config.future_ball_pos_key not in batch:
+                raise ValueError(
+                    "Kalman future-conditioning for scene branches requires history observations for "
+                    f"`{self.config.future_ball_pos_key}` in the batch. "
+                    f"Batch keys: {sorted(batch.keys())}."
+                )
             if self.config.future_ball_pos_key in batch:
                 ball_obs = batch[self.config.future_ball_pos_key]
                 if ball_obs.ndim == 2:
@@ -590,17 +622,24 @@ class DiffusionModel(nn.Module):
                     )
                 seq_len = ball_obs.shape[1]
 
-                if seq_len == self._future_delay_count:
-                    # Offline dataset path for scene_only/robot_scene: explicit future candidates only.
-                    ball_future_seq = ball_obs
-                elif seq_len > self.config.n_obs_steps:
-                    ball_history = ball_obs[:, : self.config.n_obs_steps]
-                    ball_future_seq = ball_obs[:, self.config.n_obs_steps :]
-                else:
-                    # Online eval path: only history is available in the observation queue.
+                if self.config.use_kalman_future:
                     ball_history = ball_obs[:, : min(seq_len, self.config.n_obs_steps)]
+                else:
+                    if seq_len == self._future_delay_count:
+                        # Offline dataset path for scene_only/robot_scene: explicit future candidates only.
+                        ball_future_seq = ball_obs
+                    elif seq_len > self.config.n_obs_steps:
+                        ball_history = ball_obs[:, : self.config.n_obs_steps]
+                        ball_future_seq = ball_obs[:, self.config.n_obs_steps :]
+                    else:
+                        # Online eval path: only history is available in the observation queue.
+                        ball_history = ball_obs[:, : min(seq_len, self.config.n_obs_steps)]
 
-                if ball_future_seq is not None and ball_future_seq.shape[1] > 0:
+                if (
+                    not self.config.use_kalman_future
+                    and ball_future_seq is not None
+                    and ball_future_seq.shape[1] > 0
+                ):
                     ball_future = self._select_future_from_explicit_sequence(
                         ball_future_seq, future_delay_indices, branch_name=self.config.future_ball_pos_key
                     )
@@ -618,8 +657,8 @@ class DiffusionModel(nn.Module):
                             f"Expected {self._future_ball_pos_in_dim}, got {ball_future.shape[-1]}."
                         )
 
-            # In training we require explicit future ball_pos from dataset and disallow fallback paths.
-            if self.training:
+            # In training we require explicit future ball_pos from dataset unless Kalman-future is enabled.
+            if self.training and not self.config.use_kalman_future:
                 if self.config.future_ball_pos_key not in batch:
                     raise ValueError(
                         "Missing required dataset feature for training: "
@@ -639,6 +678,12 @@ class DiffusionModel(nn.Module):
                         f"expected future candidates={self._future_delay_count}."
                     )
 
+            if self.config.use_kalman_future and ball_future is None:
+                raise ValueError(
+                    "Kalman future-conditioning for scene branches could not produce a future value from "
+                    f"`{self.config.future_ball_pos_key}` history."
+                )
+
             if ball_future is None:
                 ball_cond = torch.zeros(
                     (batch_size, self._future_ball_pos_cond_dim),
@@ -651,6 +696,7 @@ class DiffusionModel(nn.Module):
                     ball_cond,
                     self.future_ball_pos_gate,
                     gate_name="future_ball_pos_gate",
+                    history_context=history_gate_context,
                 )
                 if ball_gate is not None:
                     future_gate_debug["future_ball_pos_gate_mean"] = ball_gate.mean(dim=-1)
@@ -784,6 +830,8 @@ class DiffusionModel(nn.Module):
                 )
             non_kalman_feats.append(env_state_obs[:, :n_obs_steps])
 
+        history_gate_context = torch.cat(non_kalman_feats, dim=-1).flatten(start_dim=1)
+
         future_cond = self._prepare_future_conditioning(
             batch=batch,
             batch_size=batch_size,
@@ -791,9 +839,10 @@ class DiffusionModel(nn.Module):
             device=state_obs.device,
             state_history_obs=state_obs,
             future_state_obs=future_state_obs,
+            history_gate_context=history_gate_context,
         )
 
-        non_kalman_cond = torch.cat(non_kalman_feats, dim=-1).flatten(start_dim=1)
+        non_kalman_cond = history_gate_context
         if future_cond is not None:
             non_kalman_cond = torch.cat([non_kalman_cond, future_cond], dim=-1)
         if kalman_features is None:
