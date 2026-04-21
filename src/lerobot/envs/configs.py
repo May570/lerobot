@@ -269,6 +269,7 @@ class LiberoEnv(EnvConfig):
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
     init_states: bool = True
     init_plan_path: str | None = None
+    episode_start_states_path: str | None = None
     init_plan_loop: bool = True
     init_plan_default_direction_deg: float = 270.0
     init_plan_default_speed: float = 0.30
@@ -392,6 +393,8 @@ class LiberoEnv(EnvConfig):
             kwargs["init_plan_launch_settle_steps"] = self.init_plan_launch_settle_steps
             kwargs["init_plan_launch_ramp_steps"] = self.init_plan_launch_ramp_steps
             kwargs["init_plan_warmup_steps"] = self.init_plan_warmup_steps
+        if self.episode_start_states_path:
+            kwargs["episode_start_states_path"] = self.episode_start_states_path
         return kwargs
 
 

@@ -36,6 +36,54 @@ from lerobot.processor import RobotObservation
 
 
 logger = logging.getLogger(__name__)
+_EPISODE_START_CACHE_VERSION = 1
+
+
+def load_episode_start_states(path: str | Path) -> dict[str, Any]:
+    cache_path = Path(path).expanduser()
+    with np.load(cache_path, allow_pickle=False) as data:
+        if "sim_states" not in data:
+            raise ValueError(f"Episode-start cache at {cache_path} is missing `sim_states`.")
+        sim_states = np.asarray(data["sim_states"], dtype=np.float64)
+        table_body_quats = None
+        if "table_body_quats" in data:
+            table_body_quats = np.asarray(data["table_body_quats"], dtype=np.float64)
+        metadata: dict[str, Any] = {}
+        if "metadata_json" in data:
+            metadata = json.loads(str(data["metadata_json"].item()))
+    if sim_states.ndim != 2:
+        raise ValueError(f"`sim_states` in {cache_path} must be rank-2, got shape {sim_states.shape}.")
+    if table_body_quats is not None and table_body_quats.shape != (sim_states.shape[0], 4):
+        raise ValueError(
+            f"`table_body_quats` in {cache_path} must have shape ({sim_states.shape[0]}, 4), "
+            f"got {table_body_quats.shape}."
+        )
+    metadata.setdefault("version", _EPISODE_START_CACHE_VERSION)
+    return {
+        "path": cache_path,
+        "sim_states": sim_states,
+        "table_body_quats": table_body_quats,
+        "metadata": metadata,
+    }
+
+
+def save_episode_start_states(
+    path: str | Path,
+    *,
+    sim_states: np.ndarray,
+    table_body_quats: np.ndarray | None,
+    metadata: Mapping[str, Any] | None = None,
+) -> Path:
+    out_path = Path(path).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "sim_states": np.asarray(sim_states, dtype=np.float64),
+        "metadata_json": np.asarray(json.dumps(dict(metadata or {}), ensure_ascii=True), dtype=np.str_),
+    }
+    if table_body_quats is not None:
+        payload["table_body_quats"] = np.asarray(table_body_quats, dtype=np.float64)
+    np.savez_compressed(out_path, **payload)
+    return out_path
 
 
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
@@ -123,6 +171,7 @@ class LiberoEnv(gym.Env):
         num_steps_wait: int = 10,
         control_mode: str = "relative",
         init_plan_path: str | None = None,
+        episode_start_states_path: str | None = None,
         init_plan_loop: bool = True,
         init_plan_default_direction_deg: float = 270.0,
         init_plan_default_speed: float = 0.30,
@@ -180,6 +229,9 @@ class LiberoEnv(gym.Env):
         )
         self.control_mode = control_mode
         self._init_plan_path = Path(init_plan_path).expanduser() if init_plan_path else None
+        self._episode_start_states_path = (
+            Path(episode_start_states_path).expanduser() if episode_start_states_path else None
+        )
         self._init_plan_loop = bool(init_plan_loop)
         self._init_plan_default_direction_deg = float(init_plan_default_direction_deg)
         self._init_plan_default_speed = float(init_plan_default_speed)
@@ -201,6 +253,12 @@ class LiberoEnv(gym.Env):
         self._init_plan_rows = self._load_init_plan_rows(self._init_plan_path)
         self._init_plan_index = self.episode_index
         self._init_plan_stride = n_envs
+        self._episode_start_state_index = self.episode_index
+        self._episode_start_state_stride = n_envs
+        self._episode_start_states: np.ndarray | None = None
+        self._episode_start_table_body_quats: np.ndarray | None = None
+        self._episode_start_metadata: dict[str, Any] = {}
+        self._active_episode_start_cache_idx: int | None = None
         self._dyn_ball_body_id: int | None = None
         self._dyn_ball_joint_name: str | None = None
         self._dyn_table_collision_geom_id: int | None = None
@@ -214,6 +272,16 @@ class LiberoEnv(gym.Env):
         self._dyn_grip_site_id: int | None = None
         self._dyn_ball_radius: float | None = None
         self._dyn_handles_ready = False
+        if self._episode_start_states_path is not None:
+            loaded_cache = load_episode_start_states(self._episode_start_states_path)
+            self._episode_start_states = loaded_cache["sim_states"]
+            self._episode_start_table_body_quats = loaded_cache["table_body_quats"]
+            self._episode_start_metadata = loaded_cache["metadata"]
+            logger.info(
+                "Loaded %d fixed episode-start states from %s",
+                int(self._episode_start_states.shape[0]),
+                self._episode_start_states_path,
+            )
         images = {}
         for cam in self.camera_name:
             images[self.camera_name_mapping[cam]] = spaces.Box(
@@ -604,6 +672,28 @@ class LiberoEnv(gym.Env):
         model.body_quat[self._dyn_table_body_id] = quat.astype(model.body_quat.dtype, copy=False)
         self._env.sim.forward()
 
+    def get_sim_state(self) -> np.ndarray:
+        return np.asarray(self._env.get_sim_state(), dtype=np.float64).copy()
+
+    def get_table_body_quat(self) -> np.ndarray | None:
+        self._resolve_dyn_handles()
+        if self._dyn_table_body_id is None:
+            return None
+        return np.asarray(self._env.sim.model.body_quat[self._dyn_table_body_id], dtype=np.float64).copy()
+
+    def _restore_table_body_quat(self, quat: np.ndarray | None) -> None:
+        self._resolve_dyn_handles()
+        if self._dyn_table_body_id is None:
+            return
+        target = self._dyn_base_table_quat if quat is None else np.asarray(quat, dtype=np.float64)
+        if target is None:
+            return
+        if target.shape != (4,):
+            raise ValueError(f"Expected table-body quaternion with shape (4,), got {target.shape}.")
+        model = self._env.sim.model
+        model.body_quat[self._dyn_table_body_id] = target.astype(model.body_quat.dtype, copy=False)
+        self._env.sim.forward()
+
     def _estimate_ball_radius(self, fallback: float = 0.02) -> float:
         self._resolve_dyn_handles()
         if self._dyn_ball_body_id is None:
@@ -747,6 +837,31 @@ class LiberoEnv(gym.Env):
             )
             return raw_obs, False
 
+    def _restore_episode_start_from_cache(self, *, consume: bool) -> RobotObservation:
+        if self._episode_start_states is None:
+            raise RuntimeError("Episode-start cache is not loaded.")
+        cache_len = int(self._episode_start_states.shape[0])
+        if consume:
+            cache_idx = int(self._episode_start_state_index)
+        else:
+            if self._active_episode_start_cache_idx is None:
+                raise RuntimeError("Cannot replay cached episode start before any cached episode has been consumed.")
+            cache_idx = int(self._active_episode_start_cache_idx)
+        if cache_idx < 0 or cache_idx >= cache_len:
+            raise RuntimeError(
+                f"Episode-start cache at {self._episode_start_states_path} contains {cache_len} states, "
+                f"but env tried to restore episode index {cache_idx}."
+            )
+        table_quat = None
+        if self._episode_start_table_body_quats is not None:
+            table_quat = self._episode_start_table_body_quats[cache_idx]
+        self._restore_table_body_quat(table_quat)
+        raw_obs = self._env.set_init_state(self._episode_start_states[cache_idx].copy())
+        self._active_episode_start_cache_idx = cache_idx
+        if consume:
+            self._episode_start_state_index += self._episode_start_state_stride
+        return raw_obs
+
     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
         images = {}
         for camera_name in self.camera_name:
@@ -799,15 +914,31 @@ class LiberoEnv(gym.Env):
         )
 
     def reset(self, seed=None, **kwargs):
+        options = kwargs.pop("options", None)
+        explicit_consume = kwargs.pop("consume_episode_start", None)
+        if explicit_consume is None and isinstance(options, Mapping):
+            explicit_consume = options.get("consume_episode_start")
+        if explicit_consume is None:
+            # Formal batch resets should advance the cache cursor. Auto-resets triggered by the vector env on
+            # the step after termination arrive without an explicit seed/options payload and must replay the
+            # currently active cached episode start instead of consuming the next one.
+            consume_episode_start = self._episode_start_states is None or seed is not None
+            if self._episode_start_states is not None and self._active_episode_start_cache_idx is None:
+                consume_episode_start = True
+        else:
+            consume_episode_start = bool(explicit_consume)
         super().reset(seed=seed)
         self._env.seed(seed)
         raw_obs = self._env.reset()
-        if self.init_states and self._init_states is not None:
-            raw_obs = self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])
-            self.init_state_id += self._reset_stride  # Change init_state_id when reset
-
         used_init_plan = False
-        raw_obs, used_init_plan = self._apply_init_plan_row(raw_obs)
+        if self._episode_start_states is not None:
+            raw_obs = self._restore_episode_start_from_cache(consume=consume_episode_start)
+            used_init_plan = True
+        else:
+            if self.init_states and self._init_states is not None:
+                raw_obs = self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])
+                self.init_state_id += self._reset_stride  # Change init_state_id when reset
+            raw_obs, used_init_plan = self._apply_init_plan_row(raw_obs)
 
         if not used_init_plan:
             # After reset, objects may be unstable (slightly floating, intersecting, etc.).
@@ -854,7 +985,8 @@ class LiberoEnv(gym.Env):
                 "done": bool(done),
                 "is_success": bool(is_success),
             }
-            self.reset()
+            # Keep the terminal observation intact. The enclosing VectorEnv performs the batched autoreset on the
+            # next step, which is where we decide whether the cached episode cursor should advance.
         truncated = False
         return observation, reward, terminated, truncated, info
 
@@ -959,7 +1091,10 @@ def create_libero_envs(
                 gym_kwargs=gym_kwargs,
                 control_mode=control_mode,
             )
-            out[suite_name][tid] = env_cls(fns)
+            try:
+                out[suite_name][tid] = env_cls(fns, autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP)
+            except TypeError:
+                out[suite_name][tid] = env_cls(fns)
             print(f"Built vec env | suite={suite_name} | task_id={tid} | n_envs={n_envs}")
 
     # return plain dicts for predictability
