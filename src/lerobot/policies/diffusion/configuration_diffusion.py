@@ -96,6 +96,11 @@ class DiffusionConfig(PreTrainedConfig):
             `observation.environment_state` loaded from `meta/labels.parquet`.
             When enabled, the labels-backed environment_state history is concatenated into
             global conditioning through the existing environment-state path.
+        use_env_state_to_mask_future: Whether to load labels-backed `observation.environment_state`
+            and use the most recent env-state bit to mask future-conditioning branches in non-`orig`
+            modes. When enabled, `observation.environment_state` is not concatenated into
+            global conditioning; instead, future-conditioning is kept when the latest env-state is 0
+            and zeroed out when the latest env-state is 1.
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
         kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
@@ -189,6 +194,7 @@ class DiffusionConfig(PreTrainedConfig):
     disable_future_condition_gate: bool = False
     use_history4gate: bool = False
     use_labels_environment_state: bool = False
+    use_env_state_to_mask_future: bool = False
     # Experimental: direct online Kalman conditioning branch.
     enable_kalman_condition: bool = False
     kalman_feature_mode: str = "full10"
@@ -276,6 +282,17 @@ class DiffusionConfig(PreTrainedConfig):
         if self.use_history4gate and self.disable_future_condition_gate:
             raise ValueError(
                 "`use_history4gate=True` requires `disable_future_condition_gate=False`."
+            )
+        if self.use_env_state_to_mask_future and self.model == "orig":
+            raise ValueError(
+                "`use_env_state_to_mask_future=True` requires a non-`orig` model. "
+                f"Got {self.model}."
+            )
+        if self.use_env_state_to_mask_future and self.use_labels_environment_state:
+            raise ValueError(
+                "`use_env_state_to_mask_future=True` cannot be combined with "
+                "`use_labels_environment_state=True` because env_state would be both concatenated "
+                "and used as a future mask."
             )
         if self.future_condition_delta <= 0:
             raise ValueError(
@@ -394,6 +411,17 @@ class DiffusionConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+
+        if self.use_env_state_to_mask_future:
+            if self.env_state_feature is None:
+                raise ValueError(
+                    "`use_env_state_to_mask_future=True` requires `observation.environment_state` in input_features."
+                )
+            if len(self.env_state_feature.shape) != 1 or self.env_state_feature.shape[0] != 1:
+                raise ValueError(
+                    "`use_env_state_to_mask_future=True` requires `observation.environment_state` "
+                    f"to be a 1D binary feature of shape (1,). Got {self.env_state_feature.shape}."
+                )
 
         if self.model in {"scene_only", "robot_scene"}:
             if self.input_features is None or self.future_ball_pos_key not in self.input_features:

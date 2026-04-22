@@ -179,10 +179,11 @@ class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
-        if self.config.use_labels_environment_state:
+        self._use_env_state_as_future_mask = self.config.use_env_state_to_mask_future
+        if self.config.use_labels_environment_state or self._use_env_state_as_future_mask:
             if self.config.input_features is None or OBS_ENV_STATE not in self.config.input_features:
                 raise ValueError(
-                    "`use_labels_environment_state=True` requires "
+                    "Labels-backed environment_state requires "
                     f"`{OBS_ENV_STATE}` to be present in policy input_features."
                 )
             env_feature_keys = [
@@ -190,8 +191,14 @@ class DiffusionModel(nn.Module):
             ]
             if env_feature_keys != [OBS_ENV_STATE]:
                 raise ValueError(
-                    "`use_labels_environment_state=True` requires the ENV input feature set to be exactly "
+                    "Labels-backed environment_state requires the ENV input feature set to be exactly "
                     f"[`{OBS_ENV_STATE}`]. Got {env_feature_keys}."
+                )
+            env_state_shape = tuple(self.config.input_features[OBS_ENV_STATE].shape)
+            if self._use_env_state_as_future_mask and (len(env_state_shape) != 1 or env_state_shape[0] != 1):
+                raise ValueError(
+                    "`use_env_state_to_mask_future=True` requires "
+                    f"`{OBS_ENV_STATE}` to have shape (1,). Got {self.config.input_features[OBS_ENV_STATE].shape}."
                 )
         self._kalman_pos_slice = self._parse_kalman_pos_slice(self.config.kalman_state_pos_slice)
         self._kalman_raw_dim = 0
@@ -232,7 +239,7 @@ class DiffusionModel(nn.Module):
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
                 non_kalman_global_cond_dim += self.rgb_encoder.feature_dim * num_images
-        if self.config.env_state_feature:
+        if self.config.env_state_feature and not self._use_env_state_as_future_mask:
             non_kalman_global_cond_dim += self.config.env_state_feature.shape[0]
         self._history_gate_context_dim = non_kalman_global_cond_dim * config.n_obs_steps
 
@@ -571,6 +578,7 @@ class DiffusionModel(nn.Module):
         state_history_obs: Tensor,
         future_state_obs: Tensor | None,
         history_gate_context: Tensor | None = None,
+        future_keep_mask: Tensor | None = None,
     ) -> Tensor | None:
         future_parts: list[Tensor] = []
         future_gate_debug: dict[str, Tensor] = {}
@@ -729,7 +737,35 @@ class DiffusionModel(nn.Module):
 
         if not future_parts:
             return None
-        return torch.cat(future_parts, dim=-1)
+        future_cond = torch.cat(future_parts, dim=-1)
+        if future_keep_mask is not None:
+            future_cond = future_cond * future_keep_mask.to(device=device, dtype=dtype)
+        return future_cond
+
+    def _compute_future_keep_mask_from_env_state(
+        self,
+        env_state_obs: Tensor,
+        n_obs_steps: int,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        if env_state_obs.ndim != 3:
+            raise ValueError(
+                f"`{OBS_ENV_STATE}` must have shape (B, S, D) when `use_env_state_to_mask_future=True`. "
+                f"Got {tuple(env_state_obs.shape)}."
+            )
+        if env_state_obs.shape[-1] != 1:
+            raise ValueError(
+                f"`{OBS_ENV_STATE}` must have last dimension 1 when `use_env_state_to_mask_future=True`. "
+                f"Got {tuple(env_state_obs.shape)}."
+            )
+        latest_env_state = env_state_obs[:, n_obs_steps - 1, 0]
+        is_binary = torch.logical_or(latest_env_state == 0, latest_env_state == 1)
+        if not bool(is_binary.all().item()):
+            raise ValueError(
+                f"`{OBS_ENV_STATE}` latest history step must be binary 0/1 when "
+                "`use_env_state_to_mask_future=True`."
+            )
+        return (latest_env_state == 0).to(dtype=dtype).unsqueeze(-1)
 
     def get_last_future_gate_debug(self, clear: bool = False) -> dict[str, list[float]] | None:
         if self._last_future_gate_debug is None:
@@ -835,12 +871,13 @@ class DiffusionModel(nn.Module):
                     dtype=state_obs.dtype,
                 )
 
-        if self.config.use_labels_environment_state and OBS_ENV_STATE not in batch:
+        if (self.config.use_labels_environment_state or self._use_env_state_as_future_mask) and OBS_ENV_STATE not in batch:
             raise ValueError(
-                "`use_labels_environment_state=True` requires "
+                "Labels-backed environment_state requires "
                 f"`{OBS_ENV_STATE}` in every training batch. Batch keys: {sorted(batch.keys())}."
             )
 
+        future_keep_mask: Tensor | None = None
         if self.config.env_state_feature:
             env_state_obs = batch[OBS_ENV_STATE]
             if env_state_obs.shape[1] < n_obs_steps:
@@ -858,7 +895,12 @@ class DiffusionModel(nn.Module):
                 raise ValueError(
                     f"`{OBS_ENV_STATE}` contains non-finite values in the first {n_obs_steps} history steps."
                 )
-            non_kalman_feats.append(env_state_obs[:, :n_obs_steps])
+            if self._use_env_state_as_future_mask:
+                future_keep_mask = self._compute_future_keep_mask_from_env_state(
+                    env_state_obs[:, :n_obs_steps], n_obs_steps=n_obs_steps, dtype=state_obs.dtype
+                )
+            else:
+                non_kalman_feats.append(env_state_obs[:, :n_obs_steps])
 
         history_gate_context = torch.cat(non_kalman_feats, dim=-1).flatten(start_dim=1)
 
@@ -870,6 +912,7 @@ class DiffusionModel(nn.Module):
             state_history_obs=state_obs,
             future_state_obs=future_state_obs,
             history_gate_context=history_gate_context,
+            future_keep_mask=future_keep_mask,
         )
 
         non_kalman_cond = history_gate_context

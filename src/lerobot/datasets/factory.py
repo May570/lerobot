@@ -186,16 +186,17 @@ def _maybe_add_labels_environment_state(
     cfg: TrainPipelineConfig,
 ) -> LeRobotDataset | LabelsEnvironmentStateDataset:
     use_labels_environment_state = getattr(cfg.policy, "use_labels_environment_state", False)
-    if not use_labels_environment_state:
+    use_env_state_to_mask_future = getattr(cfg.policy, "use_env_state_to_mask_future", False)
+    if not (use_labels_environment_state or use_env_state_to_mask_future):
         return dataset
 
     if isinstance(dataset, StreamingLeRobotDataset):
         raise ValueError(
-            "`use_labels_environment_state=True` is not supported with streaming datasets."
+            "Labels-backed environment_state requires a non-streaming dataset."
         )
     if not hasattr(cfg.policy, "observation_delta_indices"):
         raise ValueError(
-            "`use_labels_environment_state=True` requires a policy config with "
+            "Labels-backed environment_state requires a policy config with "
             "`observation_delta_indices` so labels-backed history can be aligned with observations."
         )
 
@@ -214,7 +215,7 @@ def _maybe_add_labels_environment_state(
         ]
         if non_obs_env_keys:
             raise ValueError(
-                "`use_labels_environment_state=True` requires the only ENV input feature to be "
+                "Labels-backed environment_state requires the only ENV input feature to be "
                 f"`{OBS_ENV_STATE}`. Found additional ENV keys: {non_obs_env_keys}."
             )
         expected_feature = PolicyFeature(type=FeatureType.ENV, shape=(wrapped_dataset.env_state_dim,))
