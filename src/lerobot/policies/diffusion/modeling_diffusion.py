@@ -179,6 +179,20 @@ class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
+        if self.config.use_labels_environment_state:
+            if self.config.input_features is None or OBS_ENV_STATE not in self.config.input_features:
+                raise ValueError(
+                    "`use_labels_environment_state=True` requires "
+                    f"`{OBS_ENV_STATE}` to be present in policy input_features."
+                )
+            env_feature_keys = [
+                key for key, feature in self.config.input_features.items() if feature.type.value == "ENV"
+            ]
+            if env_feature_keys != [OBS_ENV_STATE]:
+                raise ValueError(
+                    "`use_labels_environment_state=True` requires the ENV input feature set to be exactly "
+                    f"[`{OBS_ENV_STATE}`]. Got {env_feature_keys}."
+                )
         self._kalman_pos_slice = self._parse_kalman_pos_slice(self.config.kalman_state_pos_slice)
         self._kalman_raw_dim = 0
         self._kalman_cond_dim = 0
@@ -821,12 +835,28 @@ class DiffusionModel(nn.Module):
                     dtype=state_obs.dtype,
                 )
 
+        if self.config.use_labels_environment_state and OBS_ENV_STATE not in batch:
+            raise ValueError(
+                "`use_labels_environment_state=True` requires "
+                f"`{OBS_ENV_STATE}` in every training batch. Batch keys: {sorted(batch.keys())}."
+            )
+
         if self.config.env_state_feature:
             env_state_obs = batch[OBS_ENV_STATE]
             if env_state_obs.shape[1] < n_obs_steps:
                 raise ValueError(
                     f"`{OBS_ENV_STATE}` must contain at least {n_obs_steps} steps. "
                     f"Got shape {tuple(env_state_obs.shape)}."
+                )
+            expected_env_dim = self.config.input_features[OBS_ENV_STATE].shape[0]
+            if env_state_obs.shape[-1] != expected_env_dim:
+                raise ValueError(
+                    f"`{OBS_ENV_STATE}` last dimension must match configured shape {expected_env_dim}. "
+                    f"Got shape {tuple(env_state_obs.shape)}."
+                )
+            if not torch.isfinite(env_state_obs[:, :n_obs_steps]).all():
+                raise ValueError(
+                    f"`{OBS_ENV_STATE}` contains non-finite values in the first {n_obs_steps} history steps."
                 )
             non_kalman_feats.append(env_state_obs[:, :n_obs_steps])
 

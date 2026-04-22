@@ -92,6 +92,10 @@ class DiffusionConfig(PreTrainedConfig):
             branches. Only valid for non-`orig` model modes.
         use_history4gate: Whether future-condition gates should also see encoded observation history,
             making them history-aware. Only valid for non-`orig` modes when future gates are enabled.
+        use_labels_environment_state: Whether to augment training samples with
+            `observation.environment_state` loaded from `meta/labels.parquet`.
+            When enabled, the labels-backed environment_state history is concatenated into
+            global conditioning through the existing environment-state path.
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
         kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
@@ -184,6 +188,7 @@ class DiffusionConfig(PreTrainedConfig):
     future_ball_pos_mlp_dim: int = 8
     disable_future_condition_gate: bool = False
     use_history4gate: bool = False
+    use_labels_environment_state: bool = False
     # Experimental: direct online Kalman conditioning branch.
     enable_kalman_condition: bool = False
     kalman_feature_mode: str = "full10"
