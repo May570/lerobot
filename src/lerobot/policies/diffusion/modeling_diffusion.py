@@ -765,7 +765,12 @@ class DiffusionModel(nn.Module):
                 f"`{OBS_ENV_STATE}` latest history step must be binary 0/1 when "
                 "`use_env_state_to_mask_future=True`."
             )
-        return (latest_env_state == 0).to(dtype=dtype).unsqueeze(-1)
+        keep_mask = torch.where(
+            latest_env_state == 0,
+            torch.ones_like(latest_env_state, dtype=dtype),
+            torch.full_like(latest_env_state, 0.5, dtype=dtype),
+        )
+        return keep_mask.unsqueeze(-1)
 
     def get_last_future_gate_debug(self, clear: bool = False) -> dict[str, list[float]] | None:
         if self._last_future_gate_debug is None:

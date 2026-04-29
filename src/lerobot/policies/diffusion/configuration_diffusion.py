@@ -100,7 +100,7 @@ class DiffusionConfig(PreTrainedConfig):
             and use the most recent env-state bit to mask future-conditioning branches in non-`orig`
             modes. When enabled, `observation.environment_state` is not concatenated into
             global conditioning; instead, future-conditioning is kept when the latest env-state is 0
-            and zeroed out when the latest env-state is 1.
+            and attenuated by a factor of 0.5 when the latest env-state is 1.
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
         kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
