@@ -16,8 +16,10 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import FeatureType
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
+from lerobot.utils.constants import OBS_STATE
 
 
 @PreTrainedConfig.register_subclass("act")
@@ -118,6 +120,14 @@ class ACTConfig(PreTrainedConfig):
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
+    model: str = "orig"
+    future_condition_delta: int = 2
+    delay_random: bool = False
+    delay_random_deltas: tuple[int, ...] = (2, 3, 4, 5, 6)
+    delay_random_probs: tuple[float, ...] = (0.08, 0.17, 0.29, 0.29, 0.17)
+    future_ball_pos_key: str = "observation.ball_pos"
+    future_ball_pos_mlp_dim: int = 8
+    disable_future_condition_gate: bool = False
 
     # Training and loss computation.
     dropout: float = 0.1
@@ -150,6 +160,40 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+        if self.model not in {"orig", "scene_only"}:
+            raise ValueError(f"`model` must be one of {{'orig', 'scene_only'}}. Got {self.model}.")
+        if self.disable_future_condition_gate and self.model == "orig":
+            raise ValueError(
+                "`disable_future_condition_gate=True` requires a non-`orig` model. "
+                f"Got {self.model}."
+            )
+        if self.future_condition_delta <= 0:
+            raise ValueError(f"`future_condition_delta` must be > 0. Got {self.future_condition_delta}.")
+        if len(self.delay_random_deltas) == 0:
+            raise ValueError("`delay_random_deltas` must not be empty.")
+        if any(delta <= 0 for delta in self.delay_random_deltas):
+            raise ValueError(f"`delay_random_deltas` must contain positive integers. Got {self.delay_random_deltas}.")
+        if len(set(self.delay_random_deltas)) != len(self.delay_random_deltas):
+            raise ValueError(f"`delay_random_deltas` must not contain duplicates. Got {self.delay_random_deltas}.")
+        if len(self.delay_random_probs) != len(self.delay_random_deltas):
+            raise ValueError(
+                "`delay_random_probs` must have the same length as `delay_random_deltas`. "
+                f"Got {len(self.delay_random_probs)} vs {len(self.delay_random_deltas)}."
+            )
+        if any(prob < 0 for prob in self.delay_random_probs):
+            raise ValueError(f"`delay_random_probs` must be non-negative. Got {self.delay_random_probs}.")
+        if sum(self.delay_random_probs) <= 0:
+            raise ValueError(f"`delay_random_probs` must sum to > 0. Got {self.delay_random_probs}.")
+        if self.delay_random and self.model != "orig" and self.future_condition_delta not in self.delay_random_deltas:
+            raise ValueError(
+                "`future_condition_delta` must be included in `delay_random_deltas` when "
+                f"`delay_random=True` and model is non-orig. Got {self.future_condition_delta} "
+                f"not in {self.delay_random_deltas}."
+            )
+        if self.future_ball_pos_mlp_dim <= 0:
+            raise ValueError(
+                f"`future_ball_pos_mlp_dim` must be > 0. Got {self.future_ball_pos_mlp_dim}."
+            )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -163,10 +207,39 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if self.model == "scene_only":
+            if self.input_features is None or self.future_ball_pos_key not in self.input_features:
+                raise ValueError(f"`model={self.model}` requires `{self.future_ball_pos_key}` in input_features.")
+            ball_pos_feature = self.input_features[self.future_ball_pos_key]
+            if ball_pos_feature.type is not FeatureType.STATE:
+                raise ValueError(
+                    f"`{self.future_ball_pos_key}` must be a STATE feature. Got {ball_pos_feature.type}."
+                )
+            if len(ball_pos_feature.shape) != 1:
+                raise ValueError(
+                    f"`{self.future_ball_pos_key}` must be a 1D feature. Got shape {ball_pos_feature.shape}."
+                )
 
     @property
-    def observation_delta_indices(self) -> None:
-        return None
+    def observation_delta_indices(self) -> list[int] | None:
+        if self.model == "orig":
+            return None
+        return [0]
+
+    @property
+    def future_condition_deltas(self) -> list[int]:
+        if self.model != "orig" and self.delay_random:
+            return list(self.delay_random_deltas)
+        return [self.future_condition_delta]
+
+    @property
+    def observation_delta_indices_by_key(self) -> dict[str, list[int]] | None:
+        if self.model == "orig":
+            return None
+        by_key = {self.future_ball_pos_key: list(self.future_condition_deltas)}
+        if self.robot_state_feature is not None:
+            by_key[OBS_STATE] = [0]
+        return by_key
 
     @property
     def action_delta_indices(self) -> list:

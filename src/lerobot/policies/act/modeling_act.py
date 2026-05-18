@@ -125,19 +125,14 @@ class ACTPolicy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
-
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        batch = self._prepare_batch_for_model(batch)
 
         actions = self.model(batch)[0]
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        batch = self._prepare_batch_for_model(batch)
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
@@ -160,6 +155,25 @@ class ACTPolicy(PreTrainedPolicy):
             loss = l1_loss
 
         return loss, loss_dict
+
+    def _prepare_batch_for_model(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+
+        if OBS_STATE in batch and batch[OBS_STATE].ndim == 3 and batch[OBS_STATE].shape[1] == 1:
+            batch[OBS_STATE] = batch[OBS_STATE].squeeze(1)
+        if OBS_ENV_STATE in batch and batch[OBS_ENV_STATE].ndim == 3 and batch[OBS_ENV_STATE].shape[1] == 1:
+            batch[OBS_ENV_STATE] = batch[OBS_ENV_STATE].squeeze(1)
+
+        if self.config.image_features:
+            images = []
+            for key in self.config.image_features:
+                image = batch[key]
+                if image.ndim == 5 and image.shape[1] == 1:
+                    image = image.squeeze(1)
+                images.append(image)
+            batch[OBS_IMAGES] = images
+
+        return batch
 
 
 class ACTTemporalEnsembler:
@@ -293,6 +307,24 @@ class ACT(nn.Module):
         # The cls token forms parameters of the latent's distribution (like this [*means, *log_variances]).
         super().__init__()
         self.config = config
+        self._future_mode = self.config.model
+        self._use_future_ball_pos = self._future_mode == "scene_only"
+        self._disable_future_condition_gate = self.config.disable_future_condition_gate
+        self._future_delay_deltas = tuple(int(d) for d in self.config.future_condition_deltas)
+        self._future_delay_count = len(self._future_delay_deltas)
+        self._future_delay_index_by_delta = {delta: i for i, delta in enumerate(self._future_delay_deltas)}
+        self._delay_random_active = (
+            self.config.model != "orig" and self.config.delay_random and self._future_delay_count > 1
+        )
+        self._delay_random_probs = None
+        if self._delay_random_active:
+            probs = torch.tensor(self.config.delay_random_probs, dtype=torch.float32)
+            self._delay_random_probs = probs / probs.sum()
+        self._future_ball_pos_in_dim = 0
+        self._future_ball_pos_cond_dim = 0
+        self.future_ball_pos_mlp: nn.Module | None = None
+        self.future_ball_pos_gate: nn.Module | None = None
+        self.future_ball_pos_input_proj: nn.Module | None = None
 
         if self.config.use_vae:
             self.vae_encoder = ACTEncoder(config, is_vae_encoder=True)
@@ -346,6 +378,20 @@ class ACT(nn.Module):
                 self.config.env_state_feature.shape[0], config.dim_model
             )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
+        if self._use_future_ball_pos:
+            self._future_ball_pos_in_dim = math.prod(self.config.input_features[self.config.future_ball_pos_key].shape)
+            self._future_ball_pos_cond_dim = self.config.future_ball_pos_mlp_dim
+            self.future_ball_pos_mlp = nn.Sequential(
+                nn.Linear(self._future_ball_pos_in_dim, self._future_ball_pos_cond_dim),
+                nn.SiLU(),
+                nn.Linear(self._future_ball_pos_cond_dim, self._future_ball_pos_cond_dim),
+            )
+            if not self._disable_future_condition_gate:
+                self.future_ball_pos_gate = nn.Sequential(
+                    nn.Linear(self._future_ball_pos_cond_dim, self._future_ball_pos_cond_dim),
+                    nn.Sigmoid(),
+                )
+            self.future_ball_pos_input_proj = nn.Linear(self._future_ball_pos_cond_dim, config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
@@ -355,6 +401,8 @@ class ACT(nn.Module):
         if self.config.robot_state_feature:
             n_1d_tokens += 1
         if self.config.env_state_feature:
+            n_1d_tokens += 1
+        if self._use_future_ball_pos:
             n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
@@ -374,6 +422,87 @@ class ACT(nn.Module):
         for p in chain(self.encoder.parameters(), self.decoder.parameters()):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+    def _select_future_delay_indices(self, batch_size: int, device: torch.device) -> Tensor:
+        if self._delay_random_active and self.training:
+            if self._delay_random_probs is None:
+                raise RuntimeError("delay_random is enabled but delay_random_probs are not initialized.")
+            return torch.multinomial(self._delay_random_probs.to(device=device), batch_size, replacement=True)
+
+        fixed_delta = int(self.config.future_condition_delta)
+        fixed_idx = self._future_delay_index_by_delta.get(fixed_delta)
+        if fixed_idx is None:
+            raise ValueError(
+                "`future_condition_delta` is not present in active future delta candidates. "
+                f"Got {fixed_delta}, candidates: {self._future_delay_deltas}."
+            )
+        return torch.full((batch_size,), fixed_idx, device=device, dtype=torch.long)
+
+    def _select_future_from_explicit_sequence(
+        self,
+        future_obs: Tensor,
+        delay_indices: Tensor,
+        *,
+        branch_name: str,
+    ) -> Tensor:
+        if future_obs.ndim == 2:
+            return future_obs
+        if future_obs.ndim != 3:
+            raise ValueError(
+                f"Explicit future {branch_name} must have shape (B, S, D) or (B, D). Got {tuple(future_obs.shape)}."
+            )
+        if future_obs.shape[1] == 0:
+            raise ValueError(f"Explicit future {branch_name} has zero sequence length.")
+        if future_obs.shape[1] == 1:
+            return future_obs[:, 0]
+        if future_obs.shape[1] != self._future_delay_count:
+            raise ValueError(
+                f"Explicit future {branch_name} sequence length mismatch. "
+                f"Expected {self._future_delay_count} from deltas {self._future_delay_deltas}, "
+                f"got {future_obs.shape[1]}."
+            )
+        gather_idx = delay_indices.view(-1, 1, 1).expand(-1, 1, future_obs.shape[-1])
+        return future_obs.gather(1, gather_idx).squeeze(1)
+
+    def _prepare_future_scene_token(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor | None:
+        if not self._use_future_ball_pos:
+            return None
+        if self.future_ball_pos_mlp is None or self.future_ball_pos_input_proj is None:
+            raise RuntimeError("Future scene conditioning modules are not initialized.")
+        if self.config.future_ball_pos_key not in batch:
+            raise ValueError(
+                "Missing required dataset feature for ACT scene_only: "
+                f"`{self.config.future_ball_pos_key}`. Batch keys: {sorted(batch.keys())}."
+            )
+
+        ball_obs = batch[self.config.future_ball_pos_key]
+        if ball_obs.ndim == 1:
+            ball_obs = ball_obs.unsqueeze(0)
+        ball_future = self._select_future_from_explicit_sequence(
+            ball_obs,
+            self._select_future_delay_indices(batch_size, device=device),
+            branch_name=self.config.future_ball_pos_key,
+        )
+        ball_future = ball_future.reshape(batch_size, -1).to(device=device, dtype=dtype)
+        if ball_future.shape[-1] != self._future_ball_pos_in_dim:
+            raise ValueError(
+                "Future ball_pos dim mismatch. "
+                f"Expected {self._future_ball_pos_in_dim}, got {ball_future.shape[-1]}."
+            )
+
+        ball_cond = self.future_ball_pos_mlp(ball_future)
+        if not self._disable_future_condition_gate:
+            if self.future_ball_pos_gate is None:
+                raise RuntimeError("future_ball_pos_gate is not initialized.")
+            ball_cond = ball_cond * self.future_ball_pos_gate(ball_cond)
+        return self.future_ball_pos_input_proj(ball_cond)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
@@ -455,6 +584,13 @@ class ACT(nn.Module):
                 batch[OBS_STATE].device
             )
 
+        scene_token = self._prepare_future_scene_token(
+            batch,
+            batch_size=batch_size,
+            device=latent_sample.device,
+            dtype=latent_sample.dtype,
+        )
+
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
@@ -464,6 +600,8 @@ class ACT(nn.Module):
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+        if scene_token is not None:
+            encoder_in_tokens.append(scene_token)
 
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.
