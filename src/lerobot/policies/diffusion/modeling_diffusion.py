@@ -342,6 +342,13 @@ class DiffusionModel(nn.Module):
         end = int(parts[1]) if parts[1] else None
         return slice(start, end)
 
+    def _maybe_zero_state_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        if not self.config.zero_state_input:
+            return batch
+        zeroed_batch = dict(batch)
+        zeroed_batch[OBS_STATE] = torch.zeros_like(batch[OBS_STATE])
+        return zeroed_batch
+
     def _resolve_kalman_dt(
         self,
         batch: dict[str, Tensor],
@@ -828,6 +835,7 @@ class DiffusionModel(nn.Module):
             - default path: (full_cond, None)
             - kalman mid-only path: (non_kalman_cond, full_cond)
         """
+        batch = self._maybe_zero_state_batch(batch)
         state_obs, future_state_obs = self._split_state_sequence(batch[OBS_STATE])
         batch_size, n_obs_steps = state_obs.shape[:2]
         non_kalman_feats = [state_obs]

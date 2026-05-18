@@ -101,6 +101,9 @@ class DiffusionConfig(PreTrainedConfig):
             modes. When enabled, `observation.environment_state` is not concatenated into
             global conditioning; instead, future-conditioning is kept when the latest env-state is 0
             and attenuated by a factor of 0.5 when the latest env-state is 1.
+        zero_state_input: Whether to force all `observation.state` values to zeros right before
+            diffusion conditioning is built. This preserves the input schema and checkpoint shape
+            compatibility while ablating the state signal for both training and inference.
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
         kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
@@ -195,6 +198,7 @@ class DiffusionConfig(PreTrainedConfig):
     use_history4gate: bool = False
     use_labels_environment_state: bool = False
     use_env_state_to_mask_future: bool = False
+    zero_state_input: bool = False
     # Experimental: direct online Kalman conditioning branch.
     enable_kalman_condition: bool = False
     kalman_feature_mode: str = "full10"
