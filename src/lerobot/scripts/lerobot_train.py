@@ -451,6 +451,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
+        unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+        if has_method(unwrapped_policy, "set_training_progress"):
+            unwrapped_policy.set_training_progress(step=step, total_steps=cfg.steps)
+
         train_tracker, output_dict = update_policy(
             train_tracker,
             policy,

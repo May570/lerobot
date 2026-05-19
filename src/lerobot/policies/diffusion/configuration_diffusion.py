@@ -104,6 +104,19 @@ class DiffusionConfig(PreTrainedConfig):
         zero_state_input: Whether to force all `observation.state` values to zeros right before
             diffusion conditioning is built. This preserves the input schema and checkpoint shape
             compatibility while ablating the state signal for both training and inference.
+        enable_state_noise_curriculum: Whether to inject scheduled Gaussian perturbations into
+            normalized `observation.state` during training for the `orig` diffusion branch only.
+            The schedule starts with a clean warmup, then ramps a shared per-sample drift across
+            all observation frames, and finally ramps additional per-frame independent noise.
+        state_noise_warmup_ratio: Fraction of total training steps to keep state inputs clean
+            before any perturbation is applied.
+        state_noise_indep_start_ratio: Fraction of total training steps after which the shared
+            state noise stops ramping and per-frame independent noise starts ramping up.
+        state_noise_shared_std_max: Maximum standard deviation of the shared Gaussian noise in
+            normalized state space.
+        state_noise_indep_std_max: Maximum standard deviation of the per-frame independent
+            Gaussian noise in normalized state space.
+        state_noise_clip: Whether to clamp perturbed normalized state inputs back into [-1, 1].
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
         kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
@@ -199,6 +212,12 @@ class DiffusionConfig(PreTrainedConfig):
     use_labels_environment_state: bool = False
     use_env_state_to_mask_future: bool = False
     zero_state_input: bool = False
+    enable_state_noise_curriculum: bool = False
+    state_noise_warmup_ratio: float = 0.35
+    state_noise_indep_start_ratio: float = 0.75
+    state_noise_shared_std_max: float = 0.04
+    state_noise_indep_std_max: float = 0.02
+    state_noise_clip: bool = True
     # Experimental: direct online Kalman conditioning branch.
     enable_kalman_condition: bool = False
     kalman_feature_mode: str = "full10"
@@ -297,6 +316,40 @@ class DiffusionConfig(PreTrainedConfig):
                 "`use_env_state_to_mask_future=True` cannot be combined with "
                 "`use_labels_environment_state=True` because env_state would be both concatenated "
                 "and used as a future mask."
+            )
+        if self.enable_state_noise_curriculum and self.model != "orig":
+            raise ValueError(
+                "`enable_state_noise_curriculum=True` currently supports only `model=orig`. "
+                f"Got {self.model}."
+            )
+        if self.enable_state_noise_curriculum and self.zero_state_input:
+            raise ValueError(
+                "`enable_state_noise_curriculum=True` cannot be combined with "
+                "`zero_state_input=True`."
+            )
+        if not (0.0 <= self.state_noise_warmup_ratio < 1.0):
+            raise ValueError(
+                "`state_noise_warmup_ratio` must be in [0, 1). "
+                f"Got {self.state_noise_warmup_ratio}."
+            )
+        if not (0.0 < self.state_noise_indep_start_ratio <= 1.0):
+            raise ValueError(
+                "`state_noise_indep_start_ratio` must be in (0, 1]. "
+                f"Got {self.state_noise_indep_start_ratio}."
+            )
+        if self.state_noise_indep_start_ratio <= self.state_noise_warmup_ratio:
+            raise ValueError(
+                "`state_noise_indep_start_ratio` must be greater than "
+                f"`state_noise_warmup_ratio`. Got {self.state_noise_indep_start_ratio} <= "
+                f"{self.state_noise_warmup_ratio}."
+            )
+        if self.state_noise_shared_std_max < 0:
+            raise ValueError(
+                f"`state_noise_shared_std_max` must be >= 0. Got {self.state_noise_shared_std_max}."
+            )
+        if self.state_noise_indep_std_max < 0:
+            raise ValueError(
+                f"`state_noise_indep_std_max` must be >= 0. Got {self.state_noise_indep_std_max}."
             )
         if self.future_condition_delta <= 0:
             raise ValueError(

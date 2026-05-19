@@ -79,6 +79,9 @@ class DiffusionPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.diffusion.parameters()
 
+    def set_training_progress(self, step: int, total_steps: int) -> None:
+        self.diffusion.set_training_progress(step=step, total_steps=total_steps)
+
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
         self._queues = {
@@ -142,7 +145,7 @@ class DiffusionPolicy(PreTrainedPolicy):
         action = self._queues[ACTION].popleft()
         return action
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float] | None]:
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -151,8 +154,7 @@ class DiffusionPolicy(PreTrainedPolicy):
                     batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         loss = self.diffusion.compute_loss(batch)
-        # no output_dict so returning None
-        return loss, None
+        return loss, self.diffusion.get_last_state_noise_debug(clear=True)
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -179,6 +181,9 @@ class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
+        self._training_step = 0
+        self._total_training_steps = 0
+        self._last_state_noise_debug: dict[str, float] | None = None
         self._use_env_state_as_future_mask = self.config.use_env_state_to_mask_future
         if self.config.use_labels_environment_state or self._use_env_state_as_future_mask:
             if self.config.input_features is None or OBS_ENV_STATE not in self.config.input_features:
@@ -341,6 +346,78 @@ class DiffusionModel(nn.Module):
         start = int(parts[0]) if parts[0] else None
         end = int(parts[1]) if parts[1] else None
         return slice(start, end)
+
+    def set_training_progress(self, step: int, total_steps: int) -> None:
+        self._training_step = max(int(step), 0)
+        self._total_training_steps = max(int(total_steps), 0)
+
+    def get_last_state_noise_debug(self, clear: bool = False) -> dict[str, float] | None:
+        if self._last_state_noise_debug is None:
+            return None
+        debug = dict(self._last_state_noise_debug)
+        if clear:
+            self._last_state_noise_debug = None
+        return debug
+
+    def _state_noise_stds(self) -> tuple[float, float]:
+        if (
+            not self.config.enable_state_noise_curriculum
+            or not self.training
+            or self.config.model != "orig"
+            or self._total_training_steps <= 0
+        ):
+            return 0.0, 0.0
+
+        step = min(max(self._training_step, 0), self._total_training_steps)
+        total_steps = self._total_training_steps
+        warmup_end = self.config.state_noise_warmup_ratio * total_steps
+        indep_start = self.config.state_noise_indep_start_ratio * total_steps
+
+        if step <= warmup_end:
+            return 0.0, 0.0
+
+        shared_std = self.config.state_noise_shared_std_max
+        indep_std = 0.0
+
+        if step < indep_start:
+            ramp = (step - warmup_end) / max(indep_start - warmup_end, 1.0)
+            shared_std *= float(ramp)
+            return shared_std, 0.0
+
+        indep_ramp = (step - indep_start) / max(total_steps - indep_start, 1.0)
+        indep_std = self.config.state_noise_indep_std_max * float(indep_ramp)
+        return shared_std, indep_std
+
+    def _apply_training_state_noise(self, state_obs: Tensor) -> Tensor:
+        shared_std, indep_std = self._state_noise_stds()
+        if not self.config.enable_state_noise_curriculum:
+            self._last_state_noise_debug = None
+            return state_obs
+
+        self._last_state_noise_debug = {
+            "state_noise_step": float(self._training_step),
+            "state_noise_total_steps": float(self._total_training_steps),
+            "state_noise_shared_std": float(shared_std),
+            "state_noise_indep_std": float(indep_std),
+        }
+        if shared_std <= 0.0 and indep_std <= 0.0:
+            return state_obs
+
+        batch_size, n_obs_steps, state_dim = state_obs.shape
+        noisy_state = state_obs
+        if shared_std > 0.0:
+            shared_noise = torch.randn(
+                (batch_size, 1, state_dim),
+                device=state_obs.device,
+                dtype=state_obs.dtype,
+            )
+            noisy_state = noisy_state + shared_std * shared_noise.expand(batch_size, n_obs_steps, state_dim)
+        if indep_std > 0.0:
+            indep_noise = torch.randn_like(state_obs)
+            noisy_state = noisy_state + indep_std * indep_noise
+        if self.config.state_noise_clip:
+            noisy_state = noisy_state.clamp_(-1.0, 1.0)
+        return noisy_state
 
     def _maybe_zero_state_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if not self.config.zero_state_input:
@@ -837,6 +914,7 @@ class DiffusionModel(nn.Module):
         """
         batch = self._maybe_zero_state_batch(batch)
         state_obs, future_state_obs = self._split_state_sequence(batch[OBS_STATE])
+        state_obs = self._apply_training_state_noise(state_obs)
         batch_size, n_obs_steps = state_obs.shape[:2]
         non_kalman_feats = [state_obs]
 
