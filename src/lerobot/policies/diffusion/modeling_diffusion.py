@@ -92,8 +92,11 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
-        if self.config.model in {"scene_only", "robot_scene"}:
-            self._queues[self.config.future_ball_pos_key] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.model in {"scene_only", "robot_scene"} or self.config.enable_ball_pos_history_condition:
+            ball_pos_queue_len = self.config.n_obs_steps
+            if self.config.enable_ball_pos_history_condition:
+                ball_pos_queue_len = max(ball_pos_queue_len, self.config.ball_pos_history_steps)
+            self._queues[self.config.future_ball_pos_key] = deque(maxlen=ball_pos_queue_len)
         if self.config.enable_kalman_condition or self.config.model != "orig":
             self._queues["timestamp"] = deque(maxlen=self.config.n_obs_steps)
 
@@ -154,7 +157,7 @@ class DiffusionPolicy(PreTrainedPolicy):
                     batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         loss = self.diffusion.compute_loss(batch)
-        return loss, self.diffusion.get_last_state_noise_debug(clear=True)
+        return loss, self.diffusion.get_last_state_aug_debug(clear=True)
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -184,6 +187,7 @@ class DiffusionModel(nn.Module):
         self._training_step = 0
         self._total_training_steps = 0
         self._last_state_noise_debug: dict[str, float] | None = None
+        self._last_state_dropout_debug: dict[str, float] | None = None
         self._use_env_state_as_future_mask = self.config.use_env_state_to_mask_future
         if self.config.use_labels_environment_state or self._use_env_state_as_future_mask:
             if self.config.input_features is None or OBS_ENV_STATE not in self.config.input_features:
@@ -213,6 +217,7 @@ class DiffusionModel(nn.Module):
         self._future_mode = self.config.model
         self._use_future_robot_state = self._future_mode in {"robot_only", "robot_scene"}
         self._use_future_ball_pos = self._future_mode in {"scene_only", "robot_scene"}
+        self._use_ball_pos_history_condition = self.config.enable_ball_pos_history_condition
         self._disable_future_condition_gate = self.config.disable_future_condition_gate
         self._future_delay_deltas = tuple(int(d) for d in self.config.future_condition_deltas)
         self._future_delay_count = len(self._future_delay_deltas)
@@ -227,9 +232,12 @@ class DiffusionModel(nn.Module):
         self._future_state_cond_dim = 0
         self._future_ball_pos_in_dim = 0
         self._future_ball_pos_cond_dim = 0
+        self._ball_pos_history_in_dim = 0
+        self._ball_pos_history_cond_dim = 0
         self.future_state_gate: nn.Module | None = None
         self.future_ball_pos_mlp: nn.Module | None = None
         self.future_ball_pos_gate: nn.Module | None = None
+        self.ball_pos_history_mlp: nn.Module | None = None
         self._last_future_gate_debug: dict[str, list[float]] | None = None
         self._history_gate_context_dim = 0
 
@@ -301,10 +309,28 @@ class DiffusionModel(nn.Module):
                     nn.Linear(future_ball_gate_in_dim, self._future_ball_pos_cond_dim),
                     nn.Sigmoid(),
                 )
+        history_cond_dim = 0
+        if self._use_ball_pos_history_condition:
+            if self.config.input_features is None or self.config.future_ball_pos_key not in self.config.input_features:
+                raise ValueError(
+                    "Missing required input feature "
+                    f"`{self.config.future_ball_pos_key}` for ball_pos history conditioning."
+                )
+            self._ball_pos_history_in_dim = (
+                math.prod(self.config.input_features[self.config.future_ball_pos_key].shape)
+                * self.config.ball_pos_history_steps
+            )
+            self._ball_pos_history_cond_dim = self.config.ball_pos_history_mlp_dim
+            history_cond_dim += self._ball_pos_history_cond_dim
+            self.ball_pos_history_mlp = nn.Sequential(
+                nn.Linear(self._ball_pos_history_in_dim, self._ball_pos_history_cond_dim),
+                nn.SiLU(),
+                nn.Linear(self._ball_pos_history_cond_dim, self._ball_pos_history_cond_dim),
+            )
 
         full_global_cond_dim = non_kalman_global_cond_dim + kalman_cond_dim
-        non_kalman_global_cond_dim_flat = non_kalman_global_cond_dim * config.n_obs_steps + future_cond_dim
-        full_global_cond_dim_flat = full_global_cond_dim * config.n_obs_steps + future_cond_dim
+        non_kalman_global_cond_dim_flat = non_kalman_global_cond_dim * config.n_obs_steps + future_cond_dim + history_cond_dim
+        full_global_cond_dim_flat = full_global_cond_dim * config.n_obs_steps + future_cond_dim + history_cond_dim
         if self.config.enable_kalman_condition and self.config.enable_kalman_mid_only_condition:
             self.unet = DiffusionConditionalUnet1d(
                 config,
@@ -358,6 +384,64 @@ class DiffusionModel(nn.Module):
         if clear:
             self._last_state_noise_debug = None
         return debug
+
+    def get_last_state_dropout_debug(self, clear: bool = False) -> dict[str, float] | None:
+        if self._last_state_dropout_debug is None:
+            return None
+        debug = dict(self._last_state_dropout_debug)
+        if clear:
+            self._last_state_dropout_debug = None
+        return debug
+
+    def get_last_state_aug_debug(self, clear: bool = False) -> dict[str, float] | None:
+        debug: dict[str, float] = {}
+        if self._last_state_noise_debug is not None:
+            debug.update(self._last_state_noise_debug)
+        if self._last_state_dropout_debug is not None:
+            debug.update(self._last_state_dropout_debug)
+        if clear:
+            self._last_state_noise_debug = None
+            self._last_state_dropout_debug = None
+        return debug or None
+
+    def _state_dropout_prob(self) -> float:
+        if (
+            not self.config.enable_state_dropout_curriculum
+            or not self.training
+            or self._total_training_steps <= 0
+        ):
+            return 0.0
+
+        step = min(max(self._training_step, 0), self._total_training_steps)
+        total_steps = self._total_training_steps
+        warmup_end = self.config.state_dropout_warmup_ratio * total_steps
+        if step <= warmup_end:
+            return 0.0
+
+        ramp = (step - warmup_end) / max(total_steps - warmup_end, 1.0)
+        return self.config.state_dropout_max_prob * float(ramp)
+
+    def _apply_training_state_dropout(self, state_sequence: Tensor) -> Tensor:
+        dropout_prob = self._state_dropout_prob()
+        if not self.config.enable_state_dropout_curriculum:
+            self._last_state_dropout_debug = None
+            return state_sequence
+
+        self._last_state_dropout_debug = {
+            "state_dropout_step": float(self._training_step),
+            "state_dropout_total_steps": float(self._total_training_steps),
+            "state_dropout_prob": float(dropout_prob),
+            "state_dropout_fraction": 0.0,
+        }
+        if dropout_prob <= 0.0:
+            return state_sequence
+
+        batch_size = state_sequence.shape[0]
+        drop_mask = torch.rand((batch_size, 1, 1), device=state_sequence.device) < dropout_prob
+        self._last_state_dropout_debug["state_dropout_fraction"] = float(
+            drop_mask.to(dtype=torch.float32).mean().item()
+        )
+        return torch.where(drop_mask, torch.zeros_like(state_sequence), state_sequence)
 
     def _state_noise_stds(self) -> tuple[float, float]:
         if (
@@ -826,6 +910,52 @@ class DiffusionModel(nn.Module):
             future_cond = future_cond * future_keep_mask.to(device=device, dtype=dtype)
         return future_cond
 
+    def _prepare_ball_pos_history_conditioning(
+        self,
+        batch: dict[str, Tensor],
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tensor | None:
+        if not self._use_ball_pos_history_condition:
+            return None
+        if self.ball_pos_history_mlp is None:
+            raise RuntimeError("ball_pos_history_mlp is not initialized.")
+        if self.config.future_ball_pos_key not in batch:
+            raise ValueError(
+                "Ball-pos history conditioning requires dataset/env feature "
+                f"`{self.config.future_ball_pos_key}`. Batch keys: {sorted(batch.keys())}."
+            )
+
+        ball_obs = batch[self.config.future_ball_pos_key]
+        if ball_obs.ndim == 2:
+            ball_obs = ball_obs.unsqueeze(1)
+        if ball_obs.ndim != 3:
+            raise ValueError(
+                f"`{self.config.future_ball_pos_key}` must have shape (B, S, D). "
+                f"Got {tuple(ball_obs.shape)}."
+            )
+        if ball_obs.shape[1] < self.config.ball_pos_history_steps:
+            raise ValueError(
+                f"`{self.config.future_ball_pos_key}` must contain at least {self.config.ball_pos_history_steps} "
+                f"history steps for ball_pos history conditioning. Got shape {tuple(ball_obs.shape)}."
+            )
+
+        ball_history = ball_obs[:, : self.config.ball_pos_history_steps]
+        if not torch.isfinite(ball_history).all():
+            raise ValueError(
+                f"`{self.config.future_ball_pos_key}` contains non-finite values in the first "
+                f"{self.config.ball_pos_history_steps} history steps."
+            )
+
+        ball_history = ball_history.reshape(batch_size, -1).to(device=device, dtype=dtype)
+        if ball_history.shape[-1] != self._ball_pos_history_in_dim:
+            raise ValueError(
+                "Ball-pos history dim mismatch. "
+                f"Expected {self._ball_pos_history_in_dim}, got {ball_history.shape[-1]}."
+            )
+        return self.ball_pos_history_mlp(ball_history)
+
     def _compute_future_keep_mask_from_env_state(
         self,
         env_state_obs: Tensor,
@@ -913,6 +1043,8 @@ class DiffusionModel(nn.Module):
             - kalman mid-only path: (non_kalman_cond, full_cond)
         """
         batch = self._maybe_zero_state_batch(batch)
+        batch = dict(batch)
+        batch[OBS_STATE] = self._apply_training_state_dropout(batch[OBS_STATE])
         state_obs, future_state_obs = self._split_state_sequence(batch[OBS_STATE])
         state_obs = self._apply_training_state_noise(state_obs)
         batch_size, n_obs_steps = state_obs.shape[:2]
@@ -1005,10 +1137,18 @@ class DiffusionModel(nn.Module):
             history_gate_context=history_gate_context,
             future_keep_mask=future_keep_mask,
         )
+        ball_pos_history_cond = self._prepare_ball_pos_history_conditioning(
+            batch=batch,
+            batch_size=batch_size,
+            dtype=state_obs.dtype,
+            device=state_obs.device,
+        )
 
         non_kalman_cond = history_gate_context
         if future_cond is not None:
             non_kalman_cond = torch.cat([non_kalman_cond, future_cond], dim=-1)
+        if ball_pos_history_cond is not None:
+            non_kalman_cond = torch.cat([non_kalman_cond, ball_pos_history_cond], dim=-1)
         if kalman_features is None:
             return non_kalman_cond, None
 
@@ -1017,6 +1157,8 @@ class DiffusionModel(nn.Module):
         )
         if future_cond is not None:
             full_cond = torch.cat([full_cond, future_cond], dim=-1)
+        if ball_pos_history_cond is not None:
+            full_cond = torch.cat([full_cond, ball_pos_history_cond], dim=-1)
         if self.config.enable_kalman_mid_only_condition:
             return non_kalman_cond, full_cond
         return full_cond, None

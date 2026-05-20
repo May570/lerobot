@@ -88,6 +88,13 @@ class DiffusionConfig(PreTrainedConfig):
         delay_random_probs: Sampling probabilities aligned with `delay_random_deltas`.
         future_ball_pos_key: Observation key used by scene branches for future ball position.
         future_ball_pos_mlp_dim: Output width of the future ball_pos MLP branch before gating.
+        enable_ball_pos_history_condition: Whether to append a separate ball_pos history branch to global
+            conditioning. This keeps image/state observations at `n_obs_steps` while allowing
+            `future_ball_pos_key` alone to use a longer past window.
+        ball_pos_history_steps: Number of past/current `future_ball_pos_key` steps to feed into the
+            ball_pos history-conditioning branch when enabled.
+        ball_pos_history_mlp_dim: Output width of the ball_pos history MLP branch before concatenation into
+            global conditioning.
         disable_future_condition_gate: Whether to bypass the learned gate on future-conditioning
             branches. Only valid for non-`orig` model modes.
         use_history4gate: Whether future-condition gates should also see encoded observation history,
@@ -117,6 +124,14 @@ class DiffusionConfig(PreTrainedConfig):
         state_noise_indep_std_max: Maximum standard deviation of the per-frame independent
             Gaussian noise in normalized state space.
         state_noise_clip: Whether to clamp perturbed normalized state inputs back into [-1, 1].
+        enable_state_dropout_curriculum: Whether to schedule per-sample dropout of normalized
+            `observation.state` during training. When a sample is dropped, the entire state sequence
+            for that sample is zeroed together, so all state-dependent branches see a missing state
+            modality consistently.
+        state_dropout_warmup_ratio: Fraction of total training steps to keep state inputs intact
+            before any dropout is applied.
+        state_dropout_max_prob: Maximum probability of dropping the entire state history for a sample
+            once the curriculum reaches the end of training.
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
         kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
@@ -207,6 +222,9 @@ class DiffusionConfig(PreTrainedConfig):
     delay_random_probs: tuple[float, ...] = (0.08, 0.17, 0.29, 0.29, 0.17)
     future_ball_pos_key: str = "observation.ball_pos"
     future_ball_pos_mlp_dim: int = 8
+    enable_ball_pos_history_condition: bool = False
+    ball_pos_history_steps: int = 2
+    ball_pos_history_mlp_dim: int = 8
     disable_future_condition_gate: bool = False
     use_history4gate: bool = False
     use_labels_environment_state: bool = False
@@ -218,6 +236,9 @@ class DiffusionConfig(PreTrainedConfig):
     state_noise_shared_std_max: float = 0.04
     state_noise_indep_std_max: float = 0.02
     state_noise_clip: bool = True
+    enable_state_dropout_curriculum: bool = False
+    state_dropout_warmup_ratio: float = 0.25
+    state_dropout_max_prob: float = 0.5
     # Experimental: direct online Kalman conditioning branch.
     enable_kalman_condition: bool = False
     kalman_feature_mode: str = "full10"
@@ -306,6 +327,11 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 "`use_history4gate=True` requires `disable_future_condition_gate=False`."
             )
+        if self.enable_ball_pos_history_condition and self.model != "orig":
+            raise ValueError(
+                "`enable_ball_pos_history_condition=True` is currently supported only with `model=orig`. "
+                f"Got {self.model}."
+            )
         if self.use_env_state_to_mask_future and self.model == "orig":
             raise ValueError(
                 "`use_env_state_to_mask_future=True` requires a non-`orig` model. "
@@ -326,6 +352,24 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 "`enable_state_noise_curriculum=True` cannot be combined with "
                 "`zero_state_input=True`."
+            )
+        if self.enable_state_dropout_curriculum and self.zero_state_input:
+            raise ValueError(
+                "`enable_state_dropout_curriculum=True` cannot be combined with "
+                "`zero_state_input=True`."
+            )
+        if self.enable_state_dropout_curriculum and self.enable_state_noise_curriculum:
+            raise ValueError(
+                "`enable_state_dropout_curriculum=True` cannot be combined with "
+                "`enable_state_noise_curriculum=True`."
+            )
+        if self.ball_pos_history_steps <= 0:
+            raise ValueError(
+                f"`ball_pos_history_steps` must be > 0. Got {self.ball_pos_history_steps}."
+            )
+        if self.ball_pos_history_mlp_dim <= 0:
+            raise ValueError(
+                f"`ball_pos_history_mlp_dim` must be > 0. Got {self.ball_pos_history_mlp_dim}."
             )
         if not (0.0 <= self.state_noise_warmup_ratio < 1.0):
             raise ValueError(
@@ -350,6 +394,16 @@ class DiffusionConfig(PreTrainedConfig):
         if self.state_noise_indep_std_max < 0:
             raise ValueError(
                 f"`state_noise_indep_std_max` must be >= 0. Got {self.state_noise_indep_std_max}."
+            )
+        if not (0.0 <= self.state_dropout_warmup_ratio < 1.0):
+            raise ValueError(
+                "`state_dropout_warmup_ratio` must be in [0, 1). "
+                f"Got {self.state_dropout_warmup_ratio}."
+            )
+        if not (0.0 <= self.state_dropout_max_prob <= 1.0):
+            raise ValueError(
+                "`state_dropout_max_prob` must be in [0, 1]. "
+                f"Got {self.state_dropout_max_prob}."
             )
         if self.future_condition_delta <= 0:
             raise ValueError(
@@ -494,6 +548,21 @@ class DiffusionConfig(PreTrainedConfig):
                 raise ValueError(
                     f"`{self.future_ball_pos_key}` must be a 1D feature. Got shape {ball_pos_feature.shape}."
                 )
+        elif self.enable_ball_pos_history_condition:
+            if self.input_features is None or self.future_ball_pos_key not in self.input_features:
+                raise ValueError(
+                    "`enable_ball_pos_history_condition=True` requires "
+                    f"`{self.future_ball_pos_key}` in input_features."
+                )
+            ball_pos_feature = self.input_features[self.future_ball_pos_key]
+            if ball_pos_feature.type is not FeatureType.STATE:
+                raise ValueError(
+                    f"`{self.future_ball_pos_key}` must be a STATE feature. Got {ball_pos_feature.type}."
+                )
+            if len(ball_pos_feature.shape) != 1:
+                raise ValueError(
+                    f"`{self.future_ball_pos_key}` must be a 1D feature. Got shape {ball_pos_feature.shape}."
+                )
 
         if self.resize_shape is None and self.crop_shape is not None:
             for key, image_ft in self.image_features.items():
@@ -524,12 +593,15 @@ class DiffusionConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices_by_key(self) -> dict[str, list[int]] | None:
-        if self.model == "orig":
-            return None
         if self.use_kalman_future:
             return None
 
         by_key: dict[str, list[int]] = {}
+        if self.enable_ball_pos_history_condition:
+            by_key[self.future_ball_pos_key] = list(range(1 - self.ball_pos_history_steps, 1))
+        if self.model == "orig":
+            return by_key if by_key else None
+
         base_obs = list(range(1 - self.n_obs_steps, 1))
         future_deltas = self.future_condition_deltas
         if self.model in {"robot_only", "robot_scene"}:
