@@ -188,6 +188,11 @@ class DiffusionModel(nn.Module):
         self._total_training_steps = 0
         self._last_state_noise_debug: dict[str, float] | None = None
         self._last_state_dropout_debug: dict[str, float] | None = None
+        self._last_state_delay_debug: dict[str, float] | None = None
+        self._state_delay_candidates = tuple(int(d) for d in self.config.state_delay_deltas)
+        self._state_history_steps = self.config.n_obs_steps + (
+            (max(self._state_delay_candidates) if self.config.enable_state_delay_curriculum else 0)
+        )
         self._use_env_state_as_future_mask = self.config.use_env_state_to_mask_future
         if self.config.use_labels_environment_state or self._use_env_state_as_future_mask:
             if self.config.input_features is None or OBS_ENV_STATE not in self.config.input_features:
@@ -395,14 +400,87 @@ class DiffusionModel(nn.Module):
 
     def get_last_state_aug_debug(self, clear: bool = False) -> dict[str, float] | None:
         debug: dict[str, float] = {}
+        if self._last_state_delay_debug is not None:
+            debug.update(self._last_state_delay_debug)
         if self._last_state_noise_debug is not None:
             debug.update(self._last_state_noise_debug)
         if self._last_state_dropout_debug is not None:
             debug.update(self._last_state_dropout_debug)
         if clear:
+            self._last_state_delay_debug = None
             self._last_state_noise_debug = None
             self._last_state_dropout_debug = None
         return debug or None
+
+    def _state_delay_prob(self) -> float:
+        if (
+            not self.config.enable_state_delay_curriculum
+            or not self.training
+            or self._total_training_steps <= 0
+            or len(self._state_delay_candidates) == 0
+            or max(self._state_delay_candidates) <= 0
+        ):
+            return 0.0
+
+        step = min(max(self._training_step, 0), self._total_training_steps)
+        total_steps = self._total_training_steps
+        warmup_end = self.config.state_delay_warmup_ratio * total_steps
+        if step <= warmup_end:
+            return 0.0
+
+        ramp = (step - warmup_end) / max(total_steps - warmup_end, 1.0)
+        return self.config.state_delay_max_prob * float(ramp)
+
+    def _select_state_history_window(self, state_history_seq: Tensor) -> Tensor:
+        if state_history_seq.ndim != 3:
+            raise ValueError(
+                f"State history sequence must have shape (B, S, D). Got {tuple(state_history_seq.shape)}."
+            )
+        if state_history_seq.shape[1] < self.config.n_obs_steps:
+            raise ValueError(
+                f"`{OBS_STATE}` must contain at least {self.config.n_obs_steps} history steps. "
+                f"Got shape {tuple(state_history_seq.shape)}."
+            )
+
+        has_extended_history = state_history_seq.shape[1] >= self._state_history_steps
+        if not self.config.enable_state_delay_curriculum or not has_extended_history:
+            self._last_state_delay_debug = None
+            return state_history_seq[:, -self.config.n_obs_steps :]
+
+        delay_prob = self._state_delay_prob()
+        batch_size = state_history_seq.shape[0]
+        delay = torch.zeros((batch_size,), device=state_history_seq.device, dtype=torch.long)
+        if delay_prob > 0.0:
+            apply_delay = torch.rand((batch_size,), device=state_history_seq.device) < delay_prob
+            if bool(apply_delay.any().item()):
+                candidates = torch.tensor(
+                    self._state_delay_candidates,
+                    device=state_history_seq.device,
+                    dtype=torch.long,
+                )
+                sampled_idx = torch.randint(
+                    0,
+                    len(self._state_delay_candidates),
+                    (int(apply_delay.sum().item()),),
+                    device=state_history_seq.device,
+                )
+                sampled_delay = candidates[sampled_idx]
+                delay[apply_delay] = sampled_delay
+
+        start = (self._state_history_steps - self.config.n_obs_steps) - delay
+        offsets = torch.arange(self.config.n_obs_steps, device=state_history_seq.device)
+        gather_idx = start.unsqueeze(1) + offsets.unsqueeze(0)
+        gather_idx = gather_idx.unsqueeze(-1).expand(-1, -1, state_history_seq.shape[-1])
+        selected = torch.gather(state_history_seq, dim=1, index=gather_idx)
+
+        self._last_state_delay_debug = {
+            "state_delay_step": float(self._training_step),
+            "state_delay_total_steps": float(self._total_training_steps),
+            "state_delay_prob": float(delay_prob),
+            "state_delay_fraction": float((delay > 0).to(dtype=torch.float32).mean().item()),
+            "state_delay_avg": float(delay.to(dtype=torch.float32).mean().item()),
+        }
+        return selected
 
     def _state_dropout_prob(self) -> float:
         if (
@@ -725,16 +803,19 @@ class DiffusionModel(nn.Module):
     def _split_state_sequence(self, state_obs: Tensor) -> tuple[Tensor, Tensor | None]:
         if state_obs.ndim != 3:
             raise ValueError(f"`{OBS_STATE}` must have shape (B, S, D). Got {tuple(state_obs.shape)}.")
-        if state_obs.shape[1] < self.config.n_obs_steps:
+        history_steps = (
+            self._state_history_steps if state_obs.shape[1] >= self._state_history_steps else self.config.n_obs_steps
+        )
+        if state_obs.shape[1] < history_steps:
             raise ValueError(
-                f"`{OBS_STATE}` must contain at least {self.config.n_obs_steps} steps. "
+                f"`{OBS_STATE}` must contain at least {history_steps} steps. "
                 f"Got shape {tuple(state_obs.shape)}."
             )
 
-        state_history = state_obs[:, : self.config.n_obs_steps]
+        state_history = state_obs[:, :history_steps]
         future_state = None
-        if self._use_future_robot_state and state_obs.shape[1] > self.config.n_obs_steps:
-            future_state = state_obs[:, self.config.n_obs_steps :]
+        if self._use_future_robot_state and state_obs.shape[1] > history_steps:
+            future_state = state_obs[:, history_steps:]
         return state_history, future_state
 
     def _prepare_future_conditioning(
@@ -1044,8 +1125,9 @@ class DiffusionModel(nn.Module):
         """
         batch = self._maybe_zero_state_batch(batch)
         batch = dict(batch)
-        batch[OBS_STATE] = self._apply_training_state_dropout(batch[OBS_STATE])
-        state_obs, future_state_obs = self._split_state_sequence(batch[OBS_STATE])
+        state_history_seq, future_state_obs = self._split_state_sequence(batch[OBS_STATE])
+        state_obs = self._select_state_history_window(state_history_seq)
+        state_obs = self._apply_training_state_dropout(state_obs)
         state_obs = self._apply_training_state_noise(state_obs)
         batch_size, n_obs_steps = state_obs.shape[:2]
         non_kalman_feats = [state_obs]
@@ -1081,7 +1163,7 @@ class DiffusionModel(nn.Module):
 
         kalman_features: Tensor | None = None
         if self.config.enable_kalman_condition:
-            kalman_features = self._compute_online_kalman_from_state(batch)
+            kalman_features = self._compute_online_kalman_from_state(state_obs, batch)
             if self.kalman_feature_mlp is not None:
                 kalman_features = self.kalman_feature_mlp(kalman_features)
             if self.kalman_feature_gate is not None:
@@ -1168,7 +1250,7 @@ class DiffusionModel(nn.Module):
         global_cond, global_cond_mid = self._prepare_unet_conditioning(batch)
         return global_cond_mid if global_cond_mid is not None else global_cond
 
-    def _compute_online_kalman_from_state(self, batch: dict[str, Tensor]) -> Tensor:
+    def _compute_online_kalman_from_state(self, state_obs: Tensor, batch: dict[str, Tensor]) -> Tensor:
         """
         Compute Kalman features from observation.state on the fly.
         Returns (B, S, D):
@@ -1178,7 +1260,6 @@ class DiffusionModel(nn.Module):
           - velpred6: [vel(3), pred_exec(3)]
           - pred3: [pred_exec(3)]
         """
-        state_obs, _ = self._split_state_sequence(batch[OBS_STATE])
         b, s, _ = state_obs.shape
         z = state_obs[..., self._kalman_pos_slice]
         if z.shape[-1] != 3:

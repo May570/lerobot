@@ -132,6 +132,14 @@ class DiffusionConfig(PreTrainedConfig):
             before any dropout is applied.
         state_dropout_max_prob: Maximum probability of dropping the entire state history for a sample
             once the curriculum reaches the end of training.
+        enable_state_delay_curriculum: Whether to schedule delayed state-history sampling during
+            training. When enabled, `observation.state` loads additional past history and each sample
+            may use a stale contiguous window of length `n_obs_steps` instead of the most recent one.
+        state_delay_warmup_ratio: Fraction of total training steps to keep the most recent state
+            history window before any delayed sampling is applied.
+        state_delay_deltas: Candidate stale offsets for delayed state-history sampling.
+        state_delay_max_prob: Maximum probability of replacing the most recent state-history window
+            with a delayed one once the curriculum reaches the end of training.
         enable_kalman_condition: Whether to append an online Kalman feature branch to global conditioning.
         kalman_feature_mode: Raw Kalman feature layout.
             - "full10": [pos(3), vel(3), pred_exec(3), valid(1)]
@@ -239,6 +247,10 @@ class DiffusionConfig(PreTrainedConfig):
     enable_state_dropout_curriculum: bool = False
     state_dropout_warmup_ratio: float = 0.25
     state_dropout_max_prob: float = 0.5
+    enable_state_delay_curriculum: bool = False
+    state_delay_warmup_ratio: float = 0.25
+    state_delay_deltas: tuple[int, ...] = (2, 3, 4, 5, 6)
+    state_delay_max_prob: float = 0.5
     # Experimental: direct online Kalman conditioning branch.
     enable_kalman_condition: bool = False
     kalman_feature_mode: str = "full10"
@@ -358,6 +370,11 @@ class DiffusionConfig(PreTrainedConfig):
                 "`enable_state_dropout_curriculum=True` cannot be combined with "
                 "`zero_state_input=True`."
             )
+        if self.enable_state_delay_curriculum and self.zero_state_input:
+            raise ValueError(
+                "`enable_state_delay_curriculum=True` cannot be combined with "
+                "`zero_state_input=True`."
+            )
         if self.enable_state_dropout_curriculum and self.enable_state_noise_curriculum:
             raise ValueError(
                 "`enable_state_dropout_curriculum=True` cannot be combined with "
@@ -404,6 +421,26 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 "`state_dropout_max_prob` must be in [0, 1]. "
                 f"Got {self.state_dropout_max_prob}."
+            )
+        if not (0.0 <= self.state_delay_warmup_ratio < 1.0):
+            raise ValueError(
+                "`state_delay_warmup_ratio` must be in [0, 1). "
+                f"Got {self.state_delay_warmup_ratio}."
+            )
+        if len(self.state_delay_deltas) == 0:
+            raise ValueError("`state_delay_deltas` must not be empty.")
+        if any(delta < 0 for delta in self.state_delay_deltas):
+            raise ValueError(
+                f"`state_delay_deltas` must contain non-negative integers. Got {self.state_delay_deltas}."
+            )
+        if len(set(self.state_delay_deltas)) != len(self.state_delay_deltas):
+            raise ValueError(
+                f"`state_delay_deltas` must not contain duplicates. Got {self.state_delay_deltas}."
+            )
+        if not (0.0 <= self.state_delay_max_prob <= 1.0):
+            raise ValueError(
+                "`state_delay_max_prob` must be in [0, 1]. "
+                f"Got {self.state_delay_max_prob}."
             )
         if self.future_condition_delta <= 0:
             raise ValueError(
@@ -593,16 +630,20 @@ class DiffusionConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices_by_key(self) -> dict[str, list[int]] | None:
-        if self.use_kalman_future:
-            return None
+        state_delay_max = max(self.state_delay_deltas, default=0)
+        history_steps = self.n_obs_steps + (state_delay_max if self.enable_state_delay_curriculum else 0)
+        base_obs = list(range(1 - history_steps, 1))
 
         by_key: dict[str, list[int]] = {}
         if self.enable_ball_pos_history_condition:
             by_key[self.future_ball_pos_key] = list(range(1 - self.ball_pos_history_steps, 1))
+        if self.enable_state_delay_curriculum:
+            by_key[OBS_STATE] = list(base_obs)
+        if self.use_kalman_future:
+            return by_key if by_key else None
         if self.model == "orig":
             return by_key if by_key else None
 
-        base_obs = list(range(1 - self.n_obs_steps, 1))
         future_deltas = self.future_condition_deltas
         if self.model in {"robot_only", "robot_scene"}:
             by_key[OBS_STATE] = [*base_obs, *future_deltas]
