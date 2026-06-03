@@ -40,6 +40,8 @@ class PI05Config(PreTrainedConfig):
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
     max_action_dim: int = 32
+    # Force all observation.state values to zeros before building the PI0.5 state prompt.
+    zero_state_input: bool = False
 
     # Flow matching parameters: see openpi `PI0Pytorch`
     num_inference_steps: int = 10

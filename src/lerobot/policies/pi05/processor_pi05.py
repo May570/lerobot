@@ -53,6 +53,7 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
     max_state_dim: int = 32
     task_key: str = "task"
+    zero_state_input: bool = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
@@ -66,6 +67,10 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
         # TODO: check if this necessary
         state = deepcopy(state)
+
+        if self.zero_state_input:
+            state = torch.zeros_like(state)
+            transition[TransitionKey.OBSERVATION][OBS_STATE] = state
 
         # State should already be normalized to [-1, 1] by the NormalizerProcessorStep that runs before this step
         # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
@@ -136,7 +141,10 @@ def make_pi05_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
+        Pi05PrepareStateTokenizerProcessorStep(
+            max_state_dim=config.max_state_dim,
+            zero_state_input=config.zero_state_input,
+        ),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
             max_length=config.tokenizer_max_length,
