@@ -124,6 +124,14 @@ class DiffusionPolicy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         # stack n latest observations from the queue
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        # print(f"3.keys: {list(batch.keys())}")
+        # for key, value in batch.items():
+        #     if isinstance(value, torch.Tensor):  # 确保是 Tensor 类型
+        #         print(f"Key: {key}, Shape: {value.shape}")
+        #     elif isinstance(value, list):  # 如果是 list 类型
+        #         print(f"Key: {key}, Length: {len(value)}")
+        #     else:
+        #         print(f"Key: {key}, Unknown type")
         actions = self.diffusion.generate_actions(batch)
 
         # TODO(rcadene): make above methods return output dictionary?
@@ -211,6 +219,24 @@ class DiffusionPolicy(PreTrainedPolicy):
         # logging.info(f"1. update batch queues")
         self.update_ob = True  # 设置标志，通知RTC线程更新observation
 
+        # print(f"1.keys: {list(batch.keys())}")
+        # for key, value in batch.items():
+        #     if isinstance(value, torch.Tensor):  # 确保是 Tensor 类型
+        #         print(f"Key: {key}, Shape: {value.shape}")
+        #     elif isinstance(value, list):  # 如果是 list 类型
+        #         print(f"Key: {key}, Length: {len(value)}")
+        #     else:
+        #         print(f"Key: {key}, Unknown type")
+
+        # print(f"2.keys: {list(self._queues.keys())}")
+        # for key, value in self._queues.items():
+        #     if isinstance(value, torch.Tensor):  # 确保是 Tensor 类型
+        #         print(f"Key: {key}, Shape: {value.shape}")
+        #     elif isinstance(value, list):  # 如果是 list 类型
+        #         print(f"Key: {key}, Length: {len(value)}")
+        #     else:
+        #         print(f"Key: {key}, Unknown type")
+
         if self.config.use_rtc:
             # use RTC to select action
             if self.rtc_thread is None or not self.rtc_thread.is_alive():
@@ -238,6 +264,83 @@ class DiffusionPolicy(PreTrainedPolicy):
             
             action = self._queues[ACTION].popleft()
             return action
+
+    def offline_predict_action_chunk(self, batch: dict[str, Tensor], ground_actions: Tensor, mean: Tensor, std: Tensor) -> Tensor:
+        """Predict a chunk of actions given environment observations."""
+        # stack n latest observations from the queue
+        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        # print(f"3.keys: {list(batch.keys())}")
+        # for key, value in batch.items():
+        #     if isinstance(value, torch.Tensor):  # 确保是 Tensor 类型
+        #         print(f"Key: {key}, Shape: {value.shape}")
+        #     elif isinstance(value, list):  # 如果是 list 类型
+        #         print(f"Key: {key}, Length: {len(value)}")
+        #     else:
+        #         print(f"Key: {key}, Unknown type")
+        actions = self.diffusion.offline_generate_actions(batch)
+
+        # normalized_ground = (ground_actions - mean) / std
+        # # print(f"ground_actions: {normalized_ground}")
+        # # print(f"actions: {actions}")
+        # mse = torch.nn.MSELoss()
+        # if actions.shape[1] != normalized_ground.shape[1]:
+        #     return actions  # 如果形状不匹配，直接返回预测的动作
+        # lossA = mse(actions[:, :8], normalized_ground[:, :8])
+        # lossB = mse(actions[:, 8:], normalized_ground[:, 8:])
+        # print(f"--------lossA: {lossA}")
+        # print(f"--------lossB: {lossB}")
+
+        # TODO(rcadene): make above methods return output dictionary?
+        actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
+
+        # print(f"actions: {actions}")
+        # print(f"ground_actions: {ground_actions}")
+
+        # lossA = (actions[:, :8] - ground_actions[:, :8]).pow(2).mean()
+        # lossB = (actions[:, 8:] - ground_actions[:, 8:]).pow(2).mean()
+
+        mse = torch.nn.MSELoss()
+        if actions.shape[1] != ground_actions.shape[1]:
+            return actions  # 如果形状不匹配，直接返回预测的动作
+        lossA = mse(actions[:, :8], ground_actions[:, :8])
+        lossB = mse(actions[:, 8:], ground_actions[:, 8:])
+        print(f"--------lossA: {lossA}")
+        print(f"--------lossB: {lossB}")
+
+        return actions
+
+    @torch.no_grad
+    def offline_select_action(self, batch: dict[str, Tensor], ground_actions: Tensor, mean: Tensor, std: Tensor) -> Tensor:
+        batch = self.normalize_inputs(batch)
+        if self.config.image_features:
+            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        # Note: It's important that this happens after stacking the images into a single key.
+        self._queues = populate_queues(self._queues, batch)
+
+        # print(f"1.keys: {list(batch.keys())}")
+        # for key, value in batch.items():
+        #     if isinstance(value, torch.Tensor):  # 确保是 Tensor 类型
+        #         print(f"Key: {key}, Shape: {value.shape}")
+        #     elif isinstance(value, list):  # 如果是 list 类型
+        #         print(f"Key: {key}, Length: {len(value)}")
+        #     else:
+        #         print(f"Key: {key}, Unknown type")
+
+        # print(f"2.keys: {list(self._queues.keys())}")
+        # for key, value in self._queues.items():
+        #     if isinstance(value, torch.Tensor):  # 确保是 Tensor 类型
+        #         print(f"Key: {key}, Shape: {value.shape}")
+        #     elif isinstance(value, list):  # 如果是 list 类型
+        #         print(f"Key: {key}, Length: {len(value)}")
+        #     else:
+        #         print(f"Key: {key}, Unknown type")
+
+
+        actions = self.offline_predict_action_chunk(batch, ground_actions, mean, std)
+        self._queues[ACTION].extend(actions.transpose(0, 1))
+        action = self._queues[ACTION].popleft()
+        return action
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
@@ -375,8 +478,8 @@ class DiffusionModel(nn.Module):
 
         # Sample prior.
         sample = torch.randn(
-            # size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
-            size=(batch_size, 24, self.config.action_feature.shape[0]),
+            size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
+            # size=(batch_size, 24, self.config.action_feature.shape[0]),
             dtype=dtype,
             device=device,
             generator=generator,
@@ -474,6 +577,40 @@ class DiffusionModel(nn.Module):
             actions = self.conditional_sample(batch_size, global_cond=global_cond)
             end = start + self.config.n_action_steps
             actions = actions[:, start:end]
+
+        return actions
+
+    def offline_generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
+        """
+        This function expects `batch` to have:
+        {
+            "observation.state": (B, n_obs_steps, state_dim)
+
+            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+                AND/OR
+            "observation.environment_state": (B, environment_dim)
+        }
+        """
+        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
+        assert n_obs_steps == self.config.n_obs_steps
+
+        # Extract `n_action_steps` steps worth of actions (from the current observation).
+        start = n_obs_steps - 1
+
+        # Encode image features and concatenate them all together along with the state vector.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        # logging.info(f"4. get global_cond")
+
+        # run sampling
+        actions = self.conditional_sample(batch_size, global_cond=global_cond)
+
+        # print(f"actions:{actions}")
+        # print(f"ground_actions:{ground_actions}")
+        # time.sleep(5)
+
+        # end = start + self.config.n_action_steps
+        # actions = actions[:, start:end]
+        actions = actions[:, start:]  # 只保留从当前观测开始的动作序列，但是尾部不裁剪
 
         return actions
 
