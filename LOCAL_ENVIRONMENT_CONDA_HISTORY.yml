@@ -1,0 +1,7 @@
+name: lerobot_py312
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - ffmpeg=7.1.1
+  - cmake

@@ -1079,7 +1079,23 @@ def eval_policy(
             ball_grasp_successes.extend([False] * env.num_envs)
         batch_gate_traces = rollout_data.get("future_gate_trace", [])
         if isinstance(batch_gate_traces, list) and len(batch_gate_traces) == env.num_envs:
-            all_gate_traces.extend(batch_gate_traces)
+            trimmed_batch_gate_traces: list[list[dict[str, Any]]] = []
+            for env_idx, env_trace in enumerate(batch_gate_traces):
+                if not isinstance(env_trace, list):
+                    trimmed_batch_gate_traces.append([])
+                    continue
+                last_valid_obs_step = int(done_indices[env_idx].item()) + 5
+                trimmed_batch_gate_traces.append(
+                    [
+                        record
+                        for record in env_trace
+                        if isinstance(record, dict)
+                        and isinstance(record.get("obs_steps"), list)
+                        and len(record["obs_steps"]) >= 2
+                        and record["obs_steps"][1] <= last_valid_obs_step
+                    ]
+                )
+            all_gate_traces.extend(trimmed_batch_gate_traces)
         else:
             all_gate_traces.extend([[] for _ in range(env.num_envs)])
         if seeds:
